@@ -1,0 +1,13 @@
+{
+  "name": "@wd/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/server.js",
+  "dependencies": {
+    "@wd/core": "*",
+    "@wd/ingest": "*",
+    "@hono/node-server": "^1.13.7",
+    "hono": "^4.6.14"
+  }
+}

@@ -1,0 +1,553 @@
+# =============================================================================
+# Indicator scoring configuration
+# =============================================================================
+#
+# This file IS the model. Weights, thresholds and transforms live here rather
+# than in code so the model can be tuned and argued with directly, and so the
+# UI can show exactly what produced every score.
+#
+# Each indicator maps a raw series onto a 0-100 stress score:
+#
+#   percentile  Rank the current value against its own trailing history.
+#               Right for spreads and ratios with no natural threshold.
+#               `direction: high` means high values are stressful.
+#
+#   zscore      Standard deviations from the trailing mean, clamped.
+#               Right for roughly stationary series.
+#
+#   bands       Piecewise-linear interpolation through explicit control points.
+#               Right where history is thin or misleading and the thresholds
+#               that matter are known. Bands also express NON-MONOTONIC risk,
+#               which matters more here than it might seem: for M2 growth and
+#               real yields, BOTH extremes are dangerous. Contraction signals
+#               depression; explosion signals debasement. A percentile rank
+#               cannot represent that, and would score runaway money printing
+#               as maximally safe.
+#
+# `direction` is ignored for bands, since control points already encode it.
+# `max_age_days` drops an indicator from scoring once its data is too old —
+# a stale input is excluded rather than silently treated as current.
+# =============================================================================
+
+pillar_weights:
+  monetary: 1.3      # the sound-money lens this dashboard is built around
+  sovereign: 1.2     # government funding is the system's load-bearing assumption
+  credit: 1.3        # credit leads every serious downturn
+  realecon: 1.0
+  trade: 0.9
+  energy: 0.8
+  fx: 1.0
+  markets: 0.8       # markets react; they rarely lead
+  narrative: 0.5     # news intensity is corroboration, never primary evidence
+
+indicators:
+
+  # ------------------------------------------------------------ MONETARY ----
+  - series: d.gold_breadth
+    label: Gold at 1-year highs across currencies
+    pillar: monetary
+    weight: 3.0
+    direction: high
+    max_age_days: 10
+    transform:
+      kind: bands
+      # Gold strong against a few currencies is unremarkable; against nearly
+      # all of them at once it is a monetary-system event.
+      bands: [[0, 0], [40, 20], [60, 40], [75, 65], [85, 85], [100, 100]]
+
+  - series: d.m2_yoy
+    label: M2 money supply growth
+    pillar: monetary
+    weight: 2.5
+    direction: high
+    max_age_days: 60
+    transform:
+      kind: bands
+      # U-shaped: contraction is a depression signal, explosion is debasement.
+      bands: [[-6, 100], [-2, 92], [0, 82], [2, 45], [5, 25], [8, 35], [12, 60], [20, 85]]
+
+  - series: us.real_yield_10y
+    label: 10-year real yield
+    pillar: monetary
+    weight: 1.5
+    direction: high
+    max_age_days: 10
+    transform:
+      kind: bands
+      # Deeply negative is financial repression; sharply positive breaks
+      # leveraged balance sheets. Mild positive is the healthy middle.
+      bands: [[-2, 80], [-1, 60], [0, 40], [1, 25], [2, 35], [3, 60], [4, 85]]
+
+  - series: us.forward_inflation_5y5y
+    label: 5y5y forward inflation expectations
+    pillar: monetary
+    weight: 1.2
+    direction: high
+    max_age_days: 10
+    transform:
+      kind: bands
+      # Both deflationary collapse and unanchored expectations are failures.
+      bands: [[0.5, 85], [1.0, 60], [1.5, 35], [2.0, 20], [2.5, 35], [3.0, 65], [4.0, 95]]
+
+  - series: d.gold_silver_ratio
+    label: Gold/silver ratio
+    pillar: monetary
+    weight: 1.0
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: d.dow_gold
+    label: Dow priced in gold
+    pillar: monetary
+    weight: 1.2
+    direction: low        # equities losing ground against hard money
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: mkt.gold_vol
+    label: Gold volatility
+    pillar: monetary
+    weight: 0.8
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 15 }
+
+  # ----------------------------------------------------------- SOVEREIGN ----
+  - series: d.auction_dealer_avg
+    label: Treasury auction dealer takedown
+    pillar: sovereign
+    weight: 2.5
+    direction: high
+    max_age_days: 60
+    transform: { kind: percentile, lookback_years: 20 }
+
+  - series: d.auction_btc_avg
+    label: Treasury auction bid-to-cover
+    pillar: sovereign
+    weight: 1.8
+    direction: low
+    max_age_days: 60
+    transform: { kind: percentile, lookback_years: 20 }
+
+  - series: d.auction_indirect_avg
+    label: Treasury auction indirect (foreign) share
+    pillar: sovereign
+    weight: 1.5
+    direction: low
+    max_age_days: 60
+    transform: { kind: percentile, lookback_years: 20 }
+
+  - series: d.curve_steepening_90d
+    label: Curve re-steepening velocity
+    pillar: sovereign
+    weight: 2.0
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: ust.spread.10y2y
+    label: 10y-2y curve level
+    pillar: sovereign
+    weight: 1.0
+    direction: low
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: d.interest_to_receipts
+    label: Federal interest expense / receipts
+    pillar: sovereign
+    weight: 1.8
+    direction: high
+    max_age_days: 275
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: em.sovereign_oas
+    label: EM sovereign spreads
+    pillar: sovereign
+    weight: 1.5
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 20 }
+
+  - series: ust.yield.30y
+    label: 30-year Treasury yield
+    pillar: sovereign
+    weight: 0.8
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 25 }
+
+  # -------------------------------------------------------------- CREDIT ----
+  - series: us.hy_oas
+    label: High-yield credit spread
+    pillar: credit
+    weight: 3.0
+    direction: high
+    max_age_days: 10
+    transform:
+      kind: bands
+      # Fixed bands rather than percentile: 800bp means the same thing in any
+      # decade, and a percentile of a benign stretch would understate it.
+      bands: [[2.5, 10], [3.5, 25], [4.5, 45], [6.0, 60], [8.0, 80], [10.0, 92], [15.0, 100]]
+
+  - series: us.baa_spread
+    label: Baa corporate spread (long history)
+    pillar: credit
+    weight: 1.5
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 30 }
+
+  - series: us.ccc_oas
+    label: CCC-rated credit spread
+    pillar: credit
+    weight: 1.5
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: d.sofr_iorb
+    label: SOFR minus IORB (repo stress)
+    pillar: credit
+    weight: 2.0
+    direction: high
+    max_age_days: 10
+    transform:
+      kind: bands
+      bands: [[-15, 15], [-5, 25], [0, 35], [5, 55], [10, 75], [25, 92], [50, 100]]
+
+  - series: us.cb_liquidity_swaps
+    label: Central bank dollar swap lines
+    pillar: credit
+    weight: 2.0
+    direction: high
+    max_age_days: 20
+    transform:
+      kind: bands
+      # Millions USD. Essentially zero in calm times, so any drawing matters.
+      bands: [[0, 5], [100, 30], [1000, 60], [10000, 85], [100000, 100]]
+
+  - series: d.bank_credit_yoy
+    label: Bank credit growth
+    pillar: credit
+    weight: 2.5
+    direction: high
+    max_age_days: 25
+    transform:
+      kind: bands
+      bands: [[-8, 100], [-3, 92], [0, 80], [2, 55], [4, 35], [7, 25], [12, 45]]
+
+  - series: d.deposits_yoy
+    label: Bank deposit growth
+    pillar: credit
+    weight: 1.5
+    direction: high
+    max_age_days: 25
+    transform:
+      kind: bands
+      bands: [[-10, 100], [-4, 88], [0, 70], [3, 40], [6, 25], [12, 40]]
+
+  - series: us.nfci
+    label: Chicago Fed financial conditions
+    pillar: credit
+    weight: 1.5
+    direction: high
+    max_age_days: 20
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: us.stl_financial_stress
+    label: St. Louis Fed financial stress
+    pillar: credit
+    weight: 1.2
+    direction: high
+    max_age_days: 20
+    transform: { kind: percentile, lookback_years: 20 }
+
+  - series: us.discount_window
+    label: Discount window borrowing
+    pillar: credit
+    weight: 1.2
+    direction: high
+    max_age_days: 20
+    transform: { kind: percentile, lookback_years: 20 }
+
+  - series: us.lending_standards_ci
+    label: Banks tightening lending standards
+    pillar: credit
+    weight: 1.5
+    direction: high
+    max_age_days: 275
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: us.delinq_cre
+    label: Commercial real estate delinquency
+    pillar: credit
+    weight: 1.2
+    direction: high
+    max_age_days: 275
+    transform: { kind: percentile, lookback_years: 25 }
+
+  # ------------------------------------------------------------ REALECON ----
+  - series: us.sahm_rule
+    label: Sahm rule recession indicator
+    pillar: realecon
+    weight: 2.5
+    direction: high
+    max_age_days: 60
+    transform:
+      kind: bands
+      bands: [[-0.2, 5], [0.0, 15], [0.3, 40], [0.5, 70], [0.8, 88], [1.5, 100]]
+
+  - series: d.claims_yoy
+    label: Jobless claims growth
+    pillar: realecon
+    weight: 2.0
+    direction: high
+    max_age_days: 25
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: us.continuing_claims
+    label: Continuing jobless claims
+    pillar: realecon
+    weight: 1.2
+    direction: high
+    max_age_days: 25
+    transform: { kind: percentile, lookback_years: 20 }
+
+  - series: d.indpro_yoy
+    label: Industrial production growth
+    pillar: realecon
+    weight: 1.5
+    direction: low
+    max_age_days: 70
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: us.heavy_truck_sales
+    label: Heavy truck sales
+    pillar: realecon
+    weight: 1.2
+    direction: low
+    max_age_days: 70
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: us.housing_starts
+    label: Housing starts
+    pillar: realecon
+    weight: 1.0
+    direction: low
+    max_age_days: 70
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: us.recession_probability
+    label: Smoothed recession probability
+    pillar: realecon
+    weight: 1.5
+    direction: high
+    max_age_days: 90
+    transform:
+      kind: bands
+      bands: [[0, 5], [5, 20], [15, 45], [30, 65], [50, 85], [80, 100]]
+
+  - series: d.electricity_demand_yoy
+    label: Electricity demand growth
+    pillar: realecon
+    weight: 1.0
+    direction: low
+    max_age_days: 15
+    transform: { kind: percentile, lookback_years: 8 }
+
+  # --------------------------------------------------------------- TRADE ----
+  - series: d.copper_gold
+    label: Copper/gold ratio
+    pillar: trade
+    weight: 2.0
+    direction: low
+    max_age_days: 75
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: d.chokepoint_volume_yoy
+    label: Global chokepoint trade volume growth
+    pillar: trade
+    weight: 2.5
+    direction: low
+    max_age_days: 20
+    transform:
+      kind: bands
+      # Seaborne tonnage contracting year-over-year is a physical fact about the
+      # world economy, not a sentiment reading — hence the heavy weight.
+      bands: [[-15, 100], [-8, 88], [-3, 72], [0, 55], [3, 35], [8, 20], [15, 30]]
+
+  - series: d.suez_rerouting
+    label: Suez rerouting pressure
+    pillar: trade
+    weight: 1.0
+    direction: high
+    max_age_days: 20
+    transform: { kind: percentile, lookback_years: 8 }
+
+  # -------------------------------------------------------------- PROPERTY ---
+  # BIS credit-to-GDP gaps. The BIS's own systemic banking-crisis early warning:
+  # gaps above ~10pp have preceded most post-war banking crises.
+  - series: credit_gap.us
+    label: US credit-to-GDP gap
+    pillar: credit
+    weight: 1.0
+    direction: high
+    max_age_days: 300
+    transform:
+      kind: bands
+      bands: [[-15, 10], [-5, 25], [0, 40], [5, 60], [10, 82], [20, 100]]
+
+  - series: credit_gap.cn
+    label: China credit-to-GDP gap
+    pillar: credit
+    weight: 1.0
+    direction: high
+    max_age_days: 300
+    transform:
+      kind: bands
+      bands: [[-15, 10], [-5, 25], [0, 40], [5, 60], [10, 82], [20, 100]]
+
+  - series: property.real.us
+    label: US real house prices
+    pillar: realecon
+    weight: 1.0
+    direction: low
+    max_age_days: 300
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: property.real.cn
+    label: China real house prices
+    pillar: realecon
+    weight: 1.0
+    direction: low
+    max_age_days: 300
+    transform: { kind: percentile, lookback_years: 25 }
+
+  # -------------------------------------------------------------- ENERGY ----
+  - series: d.distillate_cover
+    label: Distillate days of cover
+    pillar: energy
+    weight: 2.0
+    direction: low
+    max_age_days: 25
+    transform: { kind: percentile, lookback_years: 15 }
+
+  - series: mkt.oil_vol
+    label: Oil volatility
+    pillar: energy
+    weight: 1.0
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 15 }
+
+  - series: oil.spr_stocks
+    label: Strategic Petroleum Reserve level
+    pillar: energy
+    weight: 1.0
+    direction: low
+    max_age_days: 25
+    transform: { kind: percentile, lookback_years: 20 }
+
+  # ------------------------------------------------------------------ FX ----
+  - series: fx.broad_dollar
+    label: Broad dollar index
+    pillar: fx
+    weight: 2.0
+    direction: high
+    max_age_days: 12
+    transform: { kind: percentile, lookback_years: 20 }
+
+  - series: d.em_fx_breadth
+    label: EM currencies at 1-year lows
+    pillar: fx
+    weight: 2.0
+    direction: high
+    max_age_days: 12
+    transform:
+      kind: bands
+      bands: [[0, 5], [25, 30], [45, 50], [65, 72], [85, 92], [100, 100]]
+
+  # ------------------------------------------------------------- MARKETS ----
+  - series: mkt.vix
+    label: VIX
+    pillar: markets
+    weight: 1.5
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 25 }
+
+  - series: d.vix_term_structure
+    label: VIX term structure
+    pillar: markets
+    weight: 2.0
+    direction: high
+    max_age_days: 10
+    transform:
+      kind: bands
+      # Above 1.0 the curve is inverted — near-term fear exceeds long-term.
+      bands: [[0.70, 10], [0.85, 25], [0.95, 45], [1.00, 65], [1.10, 85], [1.30, 100]]
+
+  - series: d.sp500_drawdown
+    label: S&P 500 drawdown from 1-year high
+    pillar: markets
+    weight: 1.5
+    direction: high
+    max_age_days: 10
+    transform:
+      kind: bands
+      bands: [[0, 5], [5, 25], [10, 45], [20, 70], [30, 88], [50, 100]]
+
+  # ------------------------------------------------------------- NARRATIVE ---
+  # GDELT coverage volume. These measure how loudly the world is discussing
+  # something, NOT whether it is true — so the pillar carries the lowest weight
+  # in the composite (0.5) and every indicator inside it is weighted lightly too.
+  # Treated as corroboration for a hard-data signal, never as evidence on its own.
+  - series: news.sovereign_default
+    label: Sovereign default coverage
+    pillar: narrative
+    weight: 1.5
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 1 }
+
+  - series: news.bank_failure
+    label: Bank failure coverage
+    pillar: narrative
+    weight: 1.5
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 1 }
+
+  - series: news.capital_controls
+    label: Capital controls coverage
+    pillar: narrative
+    weight: 1.2
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 1 }
+
+  - series: news.devaluation
+    label: Currency devaluation coverage
+    pillar: narrative
+    weight: 1.2
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 1 }
+
+  - series: news.treasury_selling
+    label: Treasury selling coverage
+    pillar: narrative
+    weight: 1.0
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 1 }
+
+  - series: news.auction_failure
+    label: Failed auction coverage
+    pillar: narrative
+    weight: 1.0
+    direction: high
+    max_age_days: 10
+    transform: { kind: percentile, lookback_years: 1 }

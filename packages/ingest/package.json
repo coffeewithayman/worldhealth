@@ -1,0 +1,11 @@
+{
+  "name": "@wd/ingest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/cli.js",
+  "dependencies": {
+    "@wd/core": "*",
+    "@wd/connectors": "*"
+  }
+}
