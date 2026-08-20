@@ -149,6 +149,11 @@ declared per indicator in `config/indicators.yaml`:
   depression, explosion signals debasement. A percentile rank cannot represent that
   and would score runaway money printing as maximally safe.
 
+  Bands are also the answer for **mostly-zero emergency facilities**. FIMA repo usage
+  is zero in ~93% of weeks, so its median, p75 and p95 are all 0 — a percentile rank
+  against that history is arithmetic noise. Bands score it against the magnitudes that
+  actually mean something instead.
+
 **2 — Pillar score** is the weighted mean of its indicators, with **coverage**
 tracked. A pillar assembled from a small fraction of its intended inputs is not a
 measurement, so below 34% coverage it is excluded from the composite rather than
@@ -212,7 +217,7 @@ signal that cannot be evaluated must never render as a signal that is quiet.
 
 | Source | What |
 |---|---|
-| **FRED** | ~85 series: credit spreads, repo, swap lines, money supply, labour, housing, volatility, IMF industrial-metal benchmarks, and the semiconductor complex |
+| **FRED** | ~87 series: credit spreads, repo, swap lines, **FIMA repo facility usage**, money supply, labour, housing, volatility, IMF industrial-metal benchmarks, and the semiconductor complex |
 | **EIA** | Crude/distillate/gasoline stocks, SPR, refinery utilisation, **daily electricity demand** |
 
 ### Metals and the chip supply chain
@@ -237,7 +242,7 @@ market-priced), semiconductor physical production, chip producer prices, and new
 orders for computers and electronics — with a listed lithium-miner index carried
 explicitly as a *proxy*, labelled as such, to be read for direction only.
 
-### Three sources worth singling out
+### Four sources worth singling out
 
 **Treasury auction takedown.** A government funding itself is the load-bearing
 assumption under the whole financial system, and auctions test it in public twice a
@@ -245,6 +250,14 @@ week. Primary dealers are *obligated* to bid, so they absorb whatever real buyer
 decline — a rising dealer share means genuine demand is failing, and it shows up
 well before yields visibly break. This is the quantitative early form of a "failed
 auction".
+
+**FIMA repo facility.** The pressure-relief valve on the same pipe. A foreign central
+bank that needs dollars can either sell Treasuries outright — pushing US yields up —
+or pledge them at the Fed and borrow against them. Usage is therefore the *quiet*
+form of foreign Treasury stress, visible weekly with a one-day lag, where TIC reports
+the same event as a holdings drop roughly six weeks later. It sat at zero for years,
+then went to $60bn in the SVB / Credit Suisse week of March 2023 and back to zero.
+Scored with `bands` rather than percentiles for the reason described above.
 
 **Maritime chokepoints.** Financial data can be managed, smoothed and revised; ships
 either transit the Strait of Hormuz or they do not. The dashboard pairs Suez with
