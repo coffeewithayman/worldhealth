@@ -178,6 +178,21 @@ indicators:
     max_age_days: 10
     transform: { kind: percentile, lookback_years: 25 }
 
+  - series: us.fima_repo
+    label: FIMA repo facility usage
+    pillar: sovereign
+    weight: 1.5
+    direction: high
+    max_age_days: 20
+    transform:
+      kind: bands
+      # Millions USD. Zero in ~93% of weeks since the facility opened in 2020, so
+      # percentiles are useless here — the median, p75 and p95 are all ~0. Bands
+      # instead, anchored on the only real firing: March 2023 peaked at 60,000
+      # during the SVB / Credit Suisse week, which maps to 100.
+      # Readings in the single millions are operational noise, not signal.
+      bands: [[0, 3], [100, 20], [1000, 45], [5000, 70], [20000, 90], [60000, 100]]
+
   # -------------------------------------------------------------- CREDIT ----
   - series: us.hy_oas
     label: High-yield credit spread

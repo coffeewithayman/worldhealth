@@ -218,3 +218,22 @@ test('swap-line watchlist trips on a material drawing', () => {
   assert.equal(b.triggered, true, '$400bn is a crisis');
   assert.equal(b.severity, 100);
 });
+
+test('FIMA repo bands score the March 2023 spike without percentile degeneracy', () => {
+  // The bands shipped in config/indicators.yaml for us.fima_repo, in millions USD.
+  const bands: Array<[number, number]> = [[0, 3], [100, 20], [1000, 45], [5000, 70], [20000, 90], [60000, 100]];
+
+  // An unused facility must read as calm but not as zero-information.
+  assert.equal(interpolateBands(bands, 0), 3, 'unused reads calm');
+  // Single-digit millions are operational noise, not signal.
+  assert.ok(interpolateBands(bands, 5) < 5, 'a few million is noise');
+  // The one real firing: $60bn in the SVB / Credit Suisse week.
+  assert.equal(interpolateBands(bands, 60_000), 100, 'March 2023 peak is maximal');
+  assert.ok(interpolateBands(bands, 3_000) > interpolateBands(bands, 105), 'monotonic through the middle');
+
+  // Why bands rather than percentile: the series is zero in ~93% of weeks, so a
+  // percentile rank scores the crisis and the calm almost identically. This is the
+  // assertion that should fail if anyone switches this indicator to `percentile`.
+  const history = [...Array(930).fill(0), ...Array(70).fill(5)];
+  assert.ok(percentileRank(history, 0) > 0.4, 'a zero reading ranks mid-pack against a mostly-zero history');
+});
