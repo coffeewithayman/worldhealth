@@ -229,13 +229,19 @@ async function main(): Promise<void> {
       const connectors = selectConnectors(flags);
       // Percentile transforms need decades to be meaningful; default to 25 years.
       const since = flags.get('since') ?? addYears(todayIso(), -25);
+      const dryRun = flags.get('dry-run') === 'true';
       console.log(`${C.bold}Backfilling ${connectors.length} sources${C.reset} since ${since}`);
       console.log(`${C.dim}This can take a few minutes and will hit upstream rate limits if repeated.${C.reset}\n`);
       const results = await withStore((store) => runStage(store, 'backfill', async () => {
-        const out = await runAll(connectors, store, { since }, 2, printOutcome);
-        return { result: out, ...ingestStageResult(out) };
+        const out = await runAll(
+          connectors, store,
+          { since, dryRun, noCache: flags.get('no-cache') === 'true' },
+          2, printOutcome,
+        );
+        // A dry run must not leave a row claiming the data was updated.
+        return { result: out, ...(dryRun ? { status: 'skipped' as const } : ingestStageResult(out)) };
       }));
-      process.exitCode = summarise(results);
+      process.exitCode = summarise(results, dryRun);
       break;
     }
 
