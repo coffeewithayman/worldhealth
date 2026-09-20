@@ -60,6 +60,17 @@ const CATALOG: FredSeries[] = [
   { fred: 'T10Y2Y', id: 'us.t10y2y_long', name: '10Y-2Y Treasury Spread (long history)', unit: 'percent', cadence: 'daily', pillar: 'sovereign', stalenessBudgetDays: 6,
     notes: 'Same measure as the Treasury-derived spread but back to 1976, covering four extra cycles. Kept as an independent cross-check and for deeper percentile baselines.' },
   { fred: 'T10Y3M', id: 'us.t10y3m_long', name: '10Y-3M Treasury Spread (long history)', unit: 'percent', cadence: 'daily', pillar: 'sovereign', stalenessBudgetDays: 6 },
+  // The pressure-relief valve on foreign Treasury selling. A foreign central bank
+  // that needs dollars can either sell Treasuries outright — pushing US yields up —
+  // or pledge them here and borrow. Usage is therefore the early, quiet form of the
+  // same stress that TIC reports as a holdings drop six weeks later.
+  //
+  // Zero in 93% of weeks since the facility opened in March 2020, so this is scored
+  // with `bands`, not percentiles: a percentile rank against a mostly-zero history
+  // is meaningless. Its one real firing was March 2023, peaking at $60bn during the
+  // SVB / Credit Suisse week.
+  { fred: 'H41RESPPALGTRFNWW', id: 'us.fima_repo', name: 'FIMA Repo Facility Usage', unit: 'millions USD', cadence: 'weekly', pillar: 'sovereign', stalenessBudgetDays: 12,
+    notes: 'Fed lending dollars to foreign central banks against Treasury collateral. Any nonzero reading means a foreign official holder chose to borrow rather than sell Treasuries; a large one means it could not raise dollars elsewhere.' },
 
   // ------------------------------------------------------------------ credit
   { fred: 'BAMLH0A0HYM2', id: 'us.hy_oas', name: 'US High Yield Option-Adjusted Spread', unit: 'percent', cadence: 'daily', pillar: 'credit', stalenessBudgetDays: 6,
@@ -189,6 +200,15 @@ const CATALOG: FredSeries[] = [
   { fred: 'DTWEXBGS', id: 'fx.broad_dollar', name: 'Nominal Broad US Dollar Index', unit: 'index', cadence: 'daily', pillar: 'fx', stalenessBudgetDays: 10,
     notes: 'A rising dollar tightens global financial conditions regardless of what the Fed says.' },
   { fred: 'DEXCHUS', id: 'fx.cny_onshore', name: 'China / US Foreign Exchange Rate (onshore CNY)', unit: 'CNY per USD', cadence: 'daily', pillar: 'fx', stalenessBudgetDays: 10 },
+  // The mirror image of the FIMA facility: dollars foreign central banks are
+  // parking *at* the Fed rather than borrowing from it. Unlike FIMA this has a
+  // full history back to 2002 and is never zero, so it is chartable and
+  // percentile-able — but it is deliberately left unscored in indicators.yaml
+  // because its direction is genuinely ambiguous. A drawdown can mean reserves
+  // are being spent defending a currency (bearish) or simply redeployed into
+  // bills (neutral), and the series alone cannot tell those apart.
+  { fred: 'WLRRAFOIAL', id: 'fx.foreign_repo_pool', name: 'Foreign Official Reverse Repo Pool', unit: 'millions USD', cadence: 'weekly', pillar: 'fx', stalenessBudgetDays: 12,
+    notes: 'Overnight dollars held at the Fed by foreign central banks and international accounts. Sharp drawdowns have coincided with FX intervention episodes, when reserves are converted to spend.' },
 
   // ------------------------------------------------------------------ trade
   { fred: 'BOPGSTB', id: 'us.trade_balance', name: 'US Trade Balance: Goods and Services', unit: 'millions USD', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 70 },
