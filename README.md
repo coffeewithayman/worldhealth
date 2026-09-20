@@ -352,13 +352,27 @@ The build is local-first but structured so hosting is a swap, not a rewrite:
 - All database access goes through the `Store` interface in `packages/core`. The
   SQLite implementation is one file; D1 or Postgres is a second file.
 - SQL is deliberately portable — `INSERT … ON CONFLICT DO UPDATE` only, valid in
-  SQLite, Postgres and D1. No SQLite extensions.
+  SQLite, Postgres and D1. No SQLite extensions, with one caveat: `source_runs`
+  and `pipeline_runs` use SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT`, which D1
+  accepts (D1 *is* SQLite) but Postgres does not — a Postgres `Store` needs
+  `GENERATED ALWAYS AS IDENTITY` there instead.
 - The API is Hono, which runs unmodified on Node and on Cloudflare Workers.
 - Every `Store` method is async even though SQLite is synchronous, so call sites
   already await.
 
-Target shape on Cloudflare: Workers + D1 + Pages, with a Cron Trigger replacing the
-systemd timer.
+Two full migration plans, with the arithmetic behind every decision:
+
+- **[docs/deploy-cloudflare.md](docs/deploy-cloudflare.md)** — $0/month on the
+  Workers free plan. Requires re-engineering the pipeline into small sharded
+  Cron Trigger invocations (D1's daily row caps and the 10 ms CPU ceiling rule
+  out the naive "Workers + D1" shape) and moving observation history to R2.
+  Live per-request scoring is also lost — the API serves a precomputed snapshot
+  instead.
+- **[docs/deploy-railway.md](docs/deploy-railway.md)** — ~$5–12/month. A
+  Postgres service plus separate API and cron services (no free tier; a volume
+  only attaches to one service, so SQLite can't be shared across the split).
+  No re-architecture: live scoring and `--as-of` backtesting keep working
+  exactly as they do locally.
 
 ---
 
