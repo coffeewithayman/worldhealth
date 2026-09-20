@@ -187,6 +187,22 @@ line: `treasury-curve` (one request per year — 25 on a backfill), and the
 pagination loops in `eia`, `portwatch`, `gdelt`, `treasury-auctions` and `bis`.
 Partition anything above ~40.
 
+**GDELT needs partitioning for a different reason than the count rule above.**
+At 12 topics × 2 requests it makes only 24 fetches — under the 40 line — so the
+count rule alone would leave it unpartitioned. But its bottleneck isn't request
+count, it's serialized wall-clock time: `gdelt.ts` blocks on `sleep(6500)`
+between every request, and a live run measured during local end-to-end testing
+(2026-09-20) took **over 4 minutes** against the connector's own "~90s" comment,
+because GDELT 429'd nearly every request that day and each retry adds another
+wait. One Worker invocation blocking through that is a bad fit regardless of
+CPU cost — sleeping doesn't burn the 10 ms budget, but it does occupy the
+invocation for minutes against a 15-min-per-day cron wall-clock allowance
+shared with every other phase, and a bad upstream day (which is not rare, per
+the observed run) can make that materially worse. Partition GDELT per topic —
+12 units, one `ArtList` + `TimelineVol` pair each — and replace the in-process
+sleep with spacing from the scheduler's own tick cadence instead of a blocking
+wait inside the invocation.
+
 ### Derive sharding
 
 One `Derivation` per invocation, reading only its declared `inputs` from R2.
