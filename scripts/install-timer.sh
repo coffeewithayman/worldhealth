@@ -24,10 +24,16 @@ Documentation=file://$REPO/README.md
 [Service]
 Type=oneshot
 WorkingDirectory=$REPO
+# Exits non-zero only when this run actually failed — a stage that threw, a
+# required source that errored, a derivation that stopped computing. Data that
+# is merely stale is critical on the dashboard but leaves the unit green, so a
+# red unit here always means something changed tonight.
 ExecStart=$NODE_BIN $REPO/packages/ingest/dist/cli.js daily
 # Sources are fetched with bounded concurrency and retries; if the whole run is
 # still going after 30 minutes something is wrong.
 TimeoutStartSec=1800
+# Not a TTY, so the logger emits JSON lines: `journalctl … | jq` works directly.
+Environment=WD_LOG_LEVEL=info
 Nice=10
 EOF
 
@@ -56,6 +62,7 @@ echo "Installed. Useful commands:"
 echo "  systemctl --user list-timers world-dashboard.timer"
 echo "  systemctl --user start world-dashboard.service   # run once now"
 echo "  journalctl --user -u world-dashboard.service -n 50"
+echo "  npm run alerts                                   # what is broken right now"
 echo
 echo "Note: without lingering enabled, user timers only run while you are logged in."
 echo "  sudo loginctl enable-linger $USER"

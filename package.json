@@ -21,10 +21,11 @@
     "score": "npm run build && node packages/ingest/dist/cli.js score",
     "daily": "npm run build && node packages/ingest/dist/cli.js daily",
     "sources": "npm run build && node packages/ingest/dist/cli.js sources",
+    "alerts": "npm run build && node packages/ingest/dist/cli.js alerts",
     "api": "npm run build && node packages/api/dist/server.js",
     "web": "npm -w @wd/web run dev",
     "dev": "npm run build && concurrently -n api,web -c cyan,magenta \"node packages/api/dist/server.js\" \"npm -w @wd/web run dev\"",
-    "test": "npm run build && node --test packages/*/dist/**/*.test.js"
+    "test": "npm run build && WD_LOG_LEVEL=${WD_LOG_LEVEL:-silent} node --test packages/*/dist/**/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

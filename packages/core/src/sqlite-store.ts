@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 import { SCHEMA_STATEMENTS } from './schema.js';
 import type { CachedResponse, EventFilter, SeriesFilter, Store } from './store.js';
 import type {
-  Cadence, IsoDate, Observation, Pillar, ScoreKind, ScoreRecord,
+  Cadence, IsoDate, Observation, Pillar, PipelineRun, PipelineStage, ScoreKind, ScoreRecord,
   SeriesDef, SeriesHealth, SourceRun, WorldEvent,
 } from './types.js';
 import { daysBetween, todayIso } from './dates.js';
@@ -26,6 +26,27 @@ function toSeriesDef(r: SeriesRow): SeriesDef {
     sourceUrl: r.source_url ?? undefined,
     notes: r.notes ?? undefined,
     stalenessBudgetDays: r.staleness_budget_days,
+  };
+}
+
+interface PipelineRunRow {
+  id: number; stage: string; started_at: string; finished_at: string; status: string;
+  ok_count: number; fail_count: number; rows_written: number;
+  error: string | null; detail: string | null;
+}
+
+function toPipelineRun(r: PipelineRunRow): PipelineRun {
+  return {
+    id: r.id,
+    stage: r.stage as PipelineStage,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+    status: r.status as PipelineRun['status'],
+    okCount: r.ok_count,
+    failCount: r.fail_count,
+    rowsWritten: r.rows_written,
+    error: r.error,
+    detail: r.detail ? safeParse(r.detail) : null,
   };
 }
 
@@ -180,6 +201,35 @@ export class SqliteStore implements Store {
       eventsWritten: r.events_written,
       error: r.error,
     }));
+  }
+
+  async recordPipelineRun(run: PipelineRun): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO pipeline_runs (stage, started_at, finished_at, status, ok_count, fail_count, rows_written, error, detail)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      run.stage, run.startedAt, run.finishedAt, run.status,
+      run.okCount, run.failCount, run.rowsWritten, run.error,
+      run.detail === undefined ? null : JSON.stringify(run.detail),
+    );
+  }
+
+  async getLatestPipelineRuns(): Promise<PipelineRun[]> {
+    const rows = this.db.prepare(`
+      SELECT p.* FROM pipeline_runs p
+      JOIN (
+        SELECT stage, MAX(started_at) AS mx FROM pipeline_runs GROUP BY stage
+      ) m ON m.stage = p.stage AND m.mx = p.started_at
+      ORDER BY p.started_at DESC
+    `).all() as PipelineRunRow[];
+    return rows.map(toPipelineRun);
+  }
+
+  async getPipelineRuns(stage?: PipelineStage, limit = 50): Promise<PipelineRun[]> {
+    const rows = stage
+      ? this.db.prepare('SELECT * FROM pipeline_runs WHERE stage = ? ORDER BY started_at DESC LIMIT ?').all(stage, limit)
+      : this.db.prepare('SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT ?').all(limit);
+    return (rows as PipelineRunRow[]).map(toPipelineRun);
   }
 
   async markSeriesSuccess(seriesIds: string[], at: string): Promise<void> {

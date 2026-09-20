@@ -12,6 +12,7 @@ npm run backfill       # deep history (25y default) — needed before percentile
 npm run daily          # ingest → derive → score; the scheduler entrypoint
 npm run doctor         # probe every upstream source, write nothing (fastest triage)
 npm run sources        # connector list + which are disabled for a missing key
+npm run alerts         # what is broken and the command that fixes it; exit 1 if critical
 npm run api            # Hono server on :8787
 npm run dev            # api + Vite dev server (:5173, proxies /api to :8787)
 ```
@@ -31,13 +32,16 @@ Things the npm scripts do not cover:
 
 CLI flags (ingest/backfill/doctor/score): `--only <id,id>`, `--since YYYY-MM-DD`, `--dry-run`, `--no-cache`, `--as-of YYYY-MM-DD` (point-in-time scoring, for backtests).
 
+Logging is structured and goes to **stderr** — stdout stays the human report. `WD_LOG_LEVEL` (debug|info|warn|error|silent), `WD_LOG_FORMAT` (text|json, defaults to text on a TTY), `WD_LOG_FILE` (append). `npm test` silences it unless `WD_LOG_LEVEL` is already set.
+
 ## Architecture
 
 npm workspaces, strict TypeScript, ESM + `NodeNext`. Dependency direction is one-way: `core ← connectors ← ingest ← api`. `web` depends on nothing internal and talks only to the HTTP API.
 
 ```
 config/indicators.yaml   THE model — weights, thresholds, transforms. Not code.
-packages/core/           types, Store interface, scoring, derived series, stats, quotes, board
+packages/core/           types, Store interface, scoring, derived series, stats, quotes, board,
+                         alerts (alerts.ts), logging (log.ts), MemoryStore (test double)
 packages/connectors/     one module per upstream source, uniform Connector interface
 packages/ingest/         CLI: migrate, doctor, ingest, backfill, derive, score, daily, health
 packages/api/            Hono routes; Node today, Workers later unchanged
@@ -63,6 +67,10 @@ These are enforced by tests and by deliberate design; breaking one is usually a 
 - **`bands` vs `percentile` is a modelling decision, not a style choice.** Percentile cannot express non-monotonic risk (M2 growth and real yields are dangerous at *both* extremes) and degenerates on mostly-zero series (FIMA repo is zero in ~93% of weeks, so its median, p75 and p95 are all 0). Both cases must use `bands`.
 - **Every score carries its arithmetic.** `ScoreRecord.inputs` and `IndicatorScore.explanation` are what make the model auditable in the UI. Never write a score without them.
 - **Connector failures are isolated.** One broken feed must not abort the rest; every outcome including failure is written to `source_runs`, which is what the Sources tab reads.
+- **Every pipeline stage records itself**, including when it throws. `runStage()` in `ingest/src/stage.ts` writes a `pipeline_runs` row on success, on partial failure and on exception (then re-raises, so the exit code still tells the scheduler). This is what catches the failure no per-source view can: an update that never ran leaves every source row as green as the day the scheduler died.
+- **Alerts are computed, never stored.** `core/src/alerts.ts` turns runs + staleness + pillar coverage into a ranked list; the API and the CLI both call `collectAlerts`, so `npm run alerts` and the dashboard cannot disagree. Two rules: every alert names the command that fixes it, and a cause suppresses its symptoms (a failed source does not also raise a stale-series alert). A new alert kind belongs in `computeAlerts`, not in a route or a component.
+- **Credentials are scrubbed twice.** `redactUrl()` handles URLs we build; `scrubSecrets()` in `log.ts` also blanks the literal value of any credential-shaped env var in every emitted line, which is what catches an upstream error quoting the key back at us.
+- **The web bundle may outlive the API.** `withAlertDefaults` in `web/src/api.ts` fills fields an older server does not send — an ops feature must not be able to white-screen the page it was added to protect.
 - **SQL stays portable.** `INSERT … ON CONFLICT DO UPDATE` only (never `INSERT OR REPLACE`), TEXT for dates, no SQLite extensions. Every `Store` method is async although SQLite is synchronous, so D1/Postgres is a one-file swap.
 - **Credentials never reach a log, an error or the DB.** `core/src/http.ts` `redactUrl()` strips key-ish query params; connector errors are persisted to `source_runs.error` and served by `/api/sources`.
 - **`raw_cache` is replayability, not performance.** It keeps verbatim upstream bodies so a parsing bug can be fixed and re-run against yesterday's exact bytes without burning a free-tier quota. `--no-cache` bypasses it.

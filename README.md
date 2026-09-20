@@ -68,7 +68,9 @@ toggle in the header wins over the OS setting in both directions.
 | `GET /api/markets` | Every board row with changes over seven windows, 52-week range, five-year percentile, sparkline, and the Treasury curve today / 1mo / 1y ago |
 | `GET /api/pillar/:pillar` | Indicators with score arithmetic, contribution share and sparklines |
 | `GET /api/series/:id` | Metadata, health, quote statistics and the full observation history |
-| `GET /api/events`, `GET /api/sources`, `GET /api/health` | Event feed, feed health, liveness |
+| `GET /api/events`, `GET /api/sources` | Event feed, and feed health with pipeline history and alerts |
+| `GET /api/alerts` | What is broken and the command that fixes it, with a severity summary |
+| `GET /api/health` | Liveness, plus the alert summary and the last pipeline run — the endpoint to point a monitor at |
 
 Two presentation rules are enforced in the data layer rather than left to the
 component: a change window shorter than the series' publication gap is **omitted**
@@ -107,12 +109,30 @@ keys in `.env.local`.
 | `npm run backfill` | Deep history load (default 25 years) |
 | `npm run score` | Recompute composite, pillar and watchlist scores |
 | `npm run daily` | **ingest → derive → score** — the scheduler entrypoint |
+| `npm run alerts` | What is currently broken and what to run. Exits 1 if anything is critical |
 | `npm run api` | Serve the API and the built dashboard |
 | `npm run dev` | API + Vite dev server with hot reload |
-| `npm test` | Transform, scoring and watchlist tests |
+| `npm test` | Transform, scoring, watchlist, pipeline, logging and API tests |
 
 Useful flags: `--only <id,id>`, `--since YYYY-MM-DD`, `--dry-run`, `--no-cache`,
 and `--as-of YYYY-MM-DD` to score a past date point-in-time.
+
+### Logging
+
+Every stage, connector and request logs to **stderr**; stdout stays the human
+report, so `npm run daily > report.txt` keeps the two apart. Output is aligned text
+on a terminal and JSON lines anywhere else, which is what a journal or a log shipper
+wants without a bespoke parser.
+
+| Variable | Effect |
+|---|---|
+| `WD_LOG_LEVEL` | `debug` \| `info` (default) \| `warn` \| `error` \| `silent` |
+| `WD_LOG_FORMAT` | `text` \| `json`. Defaults to text on a TTY, json otherwise |
+| `WD_LOG_FILE` | Append every line to this file as well as stderr |
+
+Credentials cannot reach a log line: each one is scrubbed twice, once for key-ish
+URL parameters and once for the literal value of any credential-shaped environment
+variable, so an upstream error quoting the key back at us is caught too.
 
 ### Daily scheduling
 
@@ -312,7 +332,8 @@ charting and staleness are then written once rather than once per source.
 
 **Connector failures are isolated.** One broken feed must never abort the other
 thirty. Every outcome — including failure — is written to `source_runs`, which is
-what the Sources tab reads.
+what the Sources tab reads. Stage-level failures go to `pipeline_runs` the same way,
+including the case where the stage itself throws.
 
 **Quote arithmetic happens server-side.** Changes over seven windows, the 52-week
 range, the five-year percentile and the sparkline are all computed in
@@ -341,12 +362,45 @@ systemd timer.
 
 ---
 
+## When something breaks
+
+No notifications, so **every failure has to be visible on the page itself**. Three
+layers, all reading the same computation in `packages/core/src/alerts.ts`:
+
+| Layer | What it catches |
+|---|---|
+| `source_runs` | One row per connector run. A feed that errored, went partial, or was skipped for a missing key |
+| `pipeline_runs` | One row per stage (`ingest`, `derive`, `score`, `daily`), written **even when the stage throws**. This is what catches the update that never ran |
+| Alerts | The two tables plus series staleness and pillar coverage, turned into a ranked list where every entry names the command that fixes it |
+
+The second row is the one a per-source view cannot do. A scheduler that stops firing
+leaves every source row exactly as green as it was on the last day it ran — so the
+dashboard would keep serving a frozen score with nothing to say it was frozen. An
+update older than 36 hours is a warning, older than 72 a critical.
+
+Alerts appear **above the composite score** on the overview, in full on the Sources
+tab beside the pipeline table, and as the masthead pill from every tab. The same
+list is on the terminal: `npm run alerts`, which exits 1 when anything is critical,
+and the tail of every `npm run daily`. A cron job reporting "all clear" while the
+page shows three failures would cost the reader their trust in both.
+
+Two rules keep the list worth reading: **every alert names its fix**, and **a cause
+suppresses its symptoms** — a source that failed to run does not also raise a stale
+alert for the series underneath it.
+
+`npm run daily` exits non-zero only when *that run* failed — a stage that threw, a
+required source that errored, a derivation that stopped computing. Data that is
+merely stale is critical on the page but leaves the systemd unit green, because a
+unit that is red every night over an upstream nobody controls is a unit nobody
+checks. `npm run alerts` is the stricter check: it exits 1 on any critical alert.
+
+---
+
 ## Staleness
 
-You opted out of notifications, so **staleness is surfaced in the UI instead**: a
-banner on the overview, per-source counts on the Sources tab, and age badges on
-individual series. Every series carries a `stalenessBudgetDays` set from its
-*publication lag*, not its cadence.
+Staleness is surfaced in the UI rather than notified: the alerts above, per-source
+counts on the Sources tab, and age badges on individual series. Every series carries
+a `stalenessBudgetDays` set from its *publication lag*, not its cadence.
 
 The budget has to cover a full period **plus** the label offset plus the release
 lag, because observations are labelled at period *start*. A monthly series labelled
@@ -365,9 +419,12 @@ today's.
 ## Testing
 
 ```bash
-npm test        # 35 tests: transforms, point-in-time discipline, aggregation,
-                #           watchlist, quote statistics, board integrity
+npm test        # 120 tests: transforms, point-in-time discipline, aggregation,
+                #            watchlist, quote statistics, board integrity,
+                #            alerting, logging, HTTP retry/redaction, both Store
+                #            implementations, connector isolation, API routes
 npm run doctor  # probe every upstream source, write nothing
+npm run alerts  # what is broken right now, exit 1 if anything is critical
 ```
 
 The tests that matter most assert the properties that are easy to get quietly wrong:
@@ -375,3 +432,13 @@ that scoring never sees data after the as-of date, that a stale input is dropped
 rather than scored, that an under-covered pillar is excluded rather than averaged,
 and that a watchlist item with missing inputs reports *unavailable* rather than
 *clear*.
+
+The failure-path tests are there for the same reason: that one broken connector does
+not stop the other thirty, that a stage which throws still leaves a row saying so and
+still exits non-zero, that a route which throws returns a labelled 500 instead of an
+empty body, and that a credential never survives a log line or an error message.
+`MemoryStore` is tested against `SqliteStore` with the same assertions, because the
+fast in-memory store is only evidence about production while the two agree.
+
+Set `WD_LOG_LEVEL=debug` to see the pipeline's own logs while a test runs; the suite
+silences them by default.

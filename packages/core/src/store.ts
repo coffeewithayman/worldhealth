@@ -1,5 +1,6 @@
 import type {
-  IsoDate, Observation, ScoreRecord, SeriesDef, SeriesHealth, SourceRun, WorldEvent,
+  IsoDate, Observation, PipelineRun, PipelineStage, ScoreRecord, SeriesDef, SeriesHealth,
+  SourceRun, WorldEvent,
 } from './types.js';
 
 export interface CachedResponse {
@@ -45,6 +46,11 @@ export interface Store {
 
   recordRun(run: SourceRun): Promise<void>;
   getLatestRuns(): Promise<SourceRun[]>;
+
+  recordPipelineRun(run: PipelineRun): Promise<void>;
+  /** The most recent run of each stage — what "is the updater alive" is read from. */
+  getLatestPipelineRuns(): Promise<PipelineRun[]>;
+  getPipelineRuns(stage?: PipelineStage, limit?: number): Promise<PipelineRun[]>;
 
   markSeriesSuccess(seriesIds: string[], at: string): Promise<void>;
   getSeriesHealth(): Promise<SeriesHealth[]>;

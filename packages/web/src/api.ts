@@ -33,13 +33,56 @@ export interface SeriesHealth {
   stale: boolean;
 }
 
+export type AlertSeverity = 'critical' | 'warning' | 'info';
+
+/** One actionable problem with the data or the pipeline. See `core/src/alerts.ts`. */
+export interface Alert {
+  id: string;
+  kind: string;
+  severity: AlertSeverity;
+  title: string;
+  detail: string;
+  action: string | null;
+  subject: string;
+  since: string | null;
+}
+
+export interface AlertSummary {
+  total: number;
+  critical: number;
+  warning: number;
+  info: number;
+  worst: AlertSeverity | null;
+}
+
+export interface PipelineRun {
+  stage: 'ingest' | 'backfill' | 'derive' | 'score' | 'daily';
+  startedAt: string;
+  finishedAt: string;
+  status: 'ok' | 'partial' | 'error' | 'skipped';
+  okCount: number;
+  failCount: number;
+  rowsWritten: number;
+  error: string | null;
+}
+
 export interface Dashboard {
   asOf: string;
   composite: { score: number | null; regime: string; pillarsElevated: number; coverage: number };
   pillars: PillarSummary[];
   watchlist: WatchlistResult[];
   compositeHistory: Array<{ scoreDate: string; value: number }>;
-  health: { totalSeries: number; staleSeries: number; stale: SeriesHealth[]; runs: SourceRun[] };
+  alerts: Alert[];
+  alertSummary: AlertSummary;
+  health: {
+    totalSeries: number;
+    staleSeries: number;
+    stale: SeriesHealth[];
+    runs: SourceRun[];
+    pipeline: PipelineRun[];
+    /** Most recent run of a stage that writes data — null when there has never been one. */
+    lastUpdate: PipelineRun | null;
+  };
 }
 
 export interface Point { date: string; value: number }
@@ -146,6 +189,14 @@ export interface SourceInfo {
   seriesCount: number; staleCount: number; lastRun: SourceRun | null;
 }
 
+export interface SourcesResponse {
+  sources: SourceInfo[];
+  alerts: Alert[];
+  alertSummary: AlertSummary;
+  /** Recent stage runs, newest first — the pipeline's own history. */
+  pipeline: PipelineRun[];
+}
+
 export interface WorldEvent {
   id: string; ts: string; sourceId: string; category: string;
   headline: string; url: string; severity: number; entities?: string[];
@@ -160,13 +211,43 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/**
+ * Fill in fields an older API did not send.
+ *
+ * The bundle and the server are separate deployments: a page held in a browser
+ * cache, or a dev server that has not been restarted since the last pull, talks
+ * to an API that predates these fields. Reading `.worst` off a missing summary
+ * white-screens the entire dashboard — an ops feature must not be able to take
+ * down the page it was added to protect.
+ */
+function withAlertDefaults(d: Dashboard): Dashboard {
+  return {
+    ...d,
+    alerts: d.alerts ?? [],
+    alertSummary: d.alertSummary ?? { total: 0, critical: 0, warning: 0, info: 0, worst: null },
+    health: {
+      ...d.health,
+      pipeline: d.health?.pipeline ?? [],
+      lastUpdate: d.health?.lastUpdate ?? null,
+    },
+  };
+}
+
 export const api = {
-  dashboard: () => get<Dashboard>('/api/dashboard'),
+  dashboard: () => get<Dashboard>('/api/dashboard').then(withAlertDefaults),
   markets: () => get<Markets>('/api/markets'),
   events: (limit = 120) => get<{ events: WorldEvent[] }>(`/api/events?limit=${limit}`),
   pillar: (p: string) => get<PillarDetail>(`/api/pillar/${encodeURIComponent(p)}`),
   series: (id: string) => get<SeriesDetail>(`/api/series/${encodeURIComponent(id)}`),
-  sources: () => get<{ sources: SourceInfo[] }>('/api/sources'),
+  sources: () => get<SourcesResponse>('/api/sources'),
+  alerts: () => get<{ alerts: Alert[]; summary: AlertSummary; ts: string }>('/api/alerts'),
+};
+
+/** Colour and icon for an alert, from the same vocabulary the scores use. */
+export const ALERT_STATUS: Record<AlertSeverity, Status> = {
+  critical: 'critical',
+  warning: 'serious',
+  info: 'unknown',
 };
 
 export const EVENT_CATEGORIES: Record<string, string> = {

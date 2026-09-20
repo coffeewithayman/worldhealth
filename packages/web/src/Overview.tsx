@@ -3,17 +3,18 @@ import {
   type Dashboard, type Markets, type Quote,
 } from './api';
 import {
-  BandScale, ChangeChip, Gauge, leadWindowFor, Meter, SectionHead, Sparkline, WINDOW_LABEL,
+  AlertPanel, BandScale, ChangeChip, Gauge, leadWindowFor, Meter, SectionHead, Sparkline, WINDOW_LABEL,
 } from './components';
 import { fmtAge, fmtDate, fmtDateShort, fmtPct, fmtValue } from './format';
 import { LineChart } from './LineChart';
 
-export function Overview({ dash, markets, onOpenPillar, onOpenSeries, onOpenMarkets }: {
+export function Overview({ dash, markets, onOpenPillar, onOpenSeries, onOpenMarkets, onOpenSources }: {
   dash: Dashboard;
   markets: Markets | null;
   onOpenPillar: (p: string) => void;
   onOpenSeries: (id: string) => void;
   onOpenMarkets: () => void;
+  onOpenSources: () => void;
 }) {
   const score = dash.composite.score;
   const status = statusFor(score);
@@ -38,7 +39,12 @@ export function Overview({ dash, markets, onOpenPillar, onOpenSeries, onOpenMark
 
   return (
     <div className="stack">
-      {dash.health.staleSeries > 0 && (
+      {/* Above the score, deliberately. A composite computed from half a model
+          is still a number between 0 and 100, and nothing about its appearance
+          says so — the reader has to be told before they read it. */}
+      <AlertPanel alerts={dash.alerts} limit={4} onShowAll={onOpenSources} />
+
+      {dash.alerts.length === 0 && dash.health.staleSeries > 0 && (
         <div className="notice">
           <span aria-hidden="true">▲</span>
           <div>

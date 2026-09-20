@@ -93,6 +93,33 @@ export interface SourceRun {
   error: string | null;
 }
 
+/** The stages a scheduler runs. `daily` wraps ingest → derive → score. */
+export type PipelineStage = 'ingest' | 'backfill' | 'derive' | 'score' | 'daily';
+
+/**
+ * One execution of a pipeline stage.
+ *
+ * `source_runs` answers "is this feed working". This answers the question a
+ * source-by-source view cannot: did the update run at all? A scheduler that
+ * stopped firing leaves every source row looking exactly as healthy as it did
+ * the day it died, which is the failure this table exists to make visible.
+ */
+export interface PipelineRun {
+  id?: number;
+  stage: PipelineStage;
+  startedAt: string;
+  finishedAt: string;
+  status: RunStatus;
+  /** Units of work that succeeded and failed — connectors, or derivations. */
+  okCount: number;
+  failCount: number;
+  rowsWritten: number;
+  /** Set when the stage itself threw, as opposed to individual units failing. */
+  error: string | null;
+  /** Stage-specific JSON: the failing unit ids, the composite score, and so on. */
+  detail: unknown;
+}
+
 export interface SeriesHealth {
   seriesId: string;
   lastObsDate: IsoDate | null;

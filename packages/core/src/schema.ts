@@ -44,6 +44,24 @@ export const SCHEMA_STATEMENTS: string[] = [
 
   `CREATE INDEX IF NOT EXISTS idx_runs_source ON source_runs (source_id, started_at DESC)`,
 
+  // One row per pipeline stage execution, written even when the stage throws.
+  // Without it a scheduler that stopped firing is invisible: every per-source
+  // row keeps reporting the success it had on the last day the job ran.
+  `CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage         TEXT NOT NULL,
+    started_at    TEXT NOT NULL,
+    finished_at   TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    ok_count      INTEGER NOT NULL DEFAULT 0,
+    fail_count    INTEGER NOT NULL DEFAULT 0,
+    rows_written  INTEGER NOT NULL DEFAULT 0,
+    error         TEXT,
+    detail        TEXT
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_pipeline_stage ON pipeline_runs (stage, started_at DESC)`,
+
   `CREATE TABLE IF NOT EXISTS series_health (
     series_id       TEXT PRIMARY KEY,
     last_obs_date   TEXT,

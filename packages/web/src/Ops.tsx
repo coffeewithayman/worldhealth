@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react';
-import { api, EVENT_CATEGORIES, type Dashboard, type SourceInfo, type WorldEvent } from './api';
-import { SectionHead } from './components';
+import {
+  api, EVENT_CATEGORIES,
+  type Dashboard, type PipelineRun, type SourcesResponse, type WorldEvent,
+} from './api';
+import { AlertPanel, SectionHead } from './components';
 import { fmtDate } from './format';
 
 /* -------------------------------------------------------------------- events */
@@ -80,11 +83,18 @@ export function EventsView() {
 /* ------------------------------------------------------------------- sources */
 
 export function SourcesView({ dash }: { dash: Dashboard }) {
-  const [sources, setSources] = useState<SourceInfo[] | null>(null);
-  useEffect(() => { api.sources().then((r) => setSources(r.sources)).catch(() => setSources([])); }, []);
+  const [data, setData] = useState<SourcesResponse | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    api.sources().then(setData).catch(() => setFailed(true));
+  }, []);
 
-  const list = sources ?? [];
-  const broken = list.filter((s) => s.lastRun?.status === 'error').length;
+  const list = data?.sources ?? [];
+  // Fall back to the dashboard payload's copy: this tab is where someone lands
+  // when something is wrong, and it must still say what while its own request
+  // is in flight or has itself failed.
+  const alerts = data?.alerts ?? dash.alerts ?? [];
+  const pipeline = data?.pipeline ?? dash.health.pipeline ?? [];
 
   return (
     <div className="stack">
@@ -100,12 +110,19 @@ export function SourcesView({ dash }: { dash: Dashboard }) {
         </p>
       </div>
 
-      {broken > 0 && (
-        <div className="notice">
-          <span aria-hidden="true">▲</span>
-          <div><strong>{broken} source{broken > 1 ? 's' : ''} failed on the last run.</strong> The error is in the table below.</div>
+      {failed && (
+        <div className="notice critical">
+          <span aria-hidden="true">■</span>
+          <div>
+            <strong>The source-health request failed.</strong> The list below is from the dashboard
+            payload and may be incomplete. Check that the API is running.
+          </div>
         </div>
       )}
+
+      <AlertPanel alerts={alerts} title="Needs attention" />
+
+      <PipelineTable runs={pipeline} lastUpdate={dash.health.lastUpdate} />
 
       <section className="card flush">
         <div className="table-scroll">
@@ -165,6 +182,7 @@ export function SourcesView({ dash }: { dash: Dashboard }) {
           <div className="card-pad" style={{ borderBottom: '1px solid var(--border)' }}>
             <div className="card-title" style={{ margin: 0 }}>Stale series ({dash.health.staleSeries})</div>
           </div>
+
           <div className="table-scroll">
             <table>
               <thead>
@@ -185,5 +203,95 @@ export function SourcesView({ dash }: { dash: Dashboard }) {
         </section>
       )}
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ pipeline */
+
+const STAGE_BLURB: Record<PipelineRun['stage'], string> = {
+  daily: 'the scheduler entrypoint — ingest, then derive, then score',
+  ingest: 'fetch from every connector',
+  backfill: 'deep history load',
+  derive: 'compute the d.* analysis series',
+  score: 'indicators → pillars → composite',
+};
+
+/**
+ * The pipeline's own health, which no per-source view can report.
+ *
+ * A scheduler that stopped firing leaves every source row exactly as green as
+ * it was on the last day it ran. This table is the only place that difference
+ * is visible, so it sits above the source list rather than below it.
+ */
+function PipelineTable({ runs, lastUpdate }: { runs: PipelineRun[]; lastUpdate: PipelineRun | null }) {
+  const latest = new Map<string, PipelineRun>();
+  for (const r of runs) if (!latest.has(r.stage)) latest.set(r.stage, r);
+  const rows = [...latest.values()];
+
+  return (
+    <section className="card flush">
+      <div className="alerts-head">
+        <span className="card-title" style={{ margin: 0 }}>Pipeline</span>
+        <span className="muted small">
+          {lastUpdate ? `last update ${new Date(lastUpdate.startedAt).toLocaleString()}` : 'never run'}
+        </span>
+      </div>
+      {rows.length === 0 ? (
+        <div className="card-pad muted small">
+          No run has ever been recorded. Run <code className="mono">npm run daily</code> to populate
+          the dashboard, then schedule it.
+        </div>
+      ) : (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Stage</th>
+                <th>Status</th>
+                <th className="num">Ok</th>
+                <th className="num">Failed</th>
+                <th className="num">Rows</th>
+                <th>Started</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const tone = r.status === 'ok' ? 'var(--status-good)'
+                  : r.status === 'partial' ? 'var(--status-warning)'
+                  : r.status === 'error' ? 'var(--status-critical)'
+                  : 'var(--status-unknown)';
+                const icon = r.status === 'ok' ? '●' : r.status === 'partial' ? '▲' : r.status === 'error' ? '■' : '·';
+                const seconds = Math.max(0, (Date.parse(r.finishedAt) - Date.parse(r.startedAt)) / 1000);
+                return (
+                  <tr key={r.stage}>
+                    <td>
+                      <div className="row-name mono">{r.stage}</div>
+                      <div className="row-sub">{STAGE_BLURB[r.stage]}</div>
+                    </td>
+                    <td style={{ whiteSpace: 'nowrap' }}>
+                      <span style={{ color: tone, fontWeight: 550 }}>
+                        <span aria-hidden="true">{icon}</span> {r.status}
+                      </span>
+                      {r.error && (
+                        <div className="small" style={{ color: 'var(--status-serious)', marginTop: 3, maxWidth: 420 }}>
+                          {r.error.slice(0, 200)}
+                        </div>
+                      )}
+                    </td>
+                    <td className="num">{r.okCount}</td>
+                    <td className="num" style={{ color: r.failCount ? 'var(--status-critical)' : undefined }}>{r.failCount}</td>
+                    <td className="num">{r.rowsWritten.toLocaleString()}</td>
+                    <td className="small muted" style={{ whiteSpace: 'nowrap' }}>
+                      {new Date(r.startedAt).toLocaleString()}
+                      <div className="row-sub">{seconds < 90 ? `${seconds.toFixed(1)}s` : `${(seconds / 60).toFixed(1)}m`}</div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }

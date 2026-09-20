@@ -1,6 +1,8 @@
 export * from './types.js';
 export * from './store.js';
 export * from './sqlite-store.js';
+export * from './memory-store.js';
+export * from './log.js';
 export * from './schema.js';
 export * from './dates.js';
 export * from './stats.js';
@@ -11,5 +13,6 @@ export * from './quotes.js';
 export * from './board.js';
 export * from './derived.js';
 export * from './scoring.js';
+export * from './alerts.js';
 export * from './watchlist.js';
 export * from './config-loader.js';

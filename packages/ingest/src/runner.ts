@@ -1,5 +1,6 @@
 import {
-  Http, todayIso, type Connector, type FetchCtx, type RunStatus, type Store,
+  describeError, Http, log, todayIso,
+  type Connector, type FetchCtx, type RunStatus, type Store,
 } from '@wd/core';
 
 export interface RunOptions {
@@ -35,28 +36,39 @@ export async function runConnector(
   const startedAt = new Date().toISOString();
   const t0 = Date.now();
   const logs: string[] = [];
+  const logger = log.child('connector', { source: connector.id });
 
   const finish = async (
     status: RunStatus, rows: number, events: number, error?: string, warnings?: string[],
   ): Promise<RunOutcome> => {
     const durationMs = Date.now() - t0;
     if (!opts.dryRun) {
-      await store.recordRun({
-        sourceId: connector.id,
-        startedAt,
-        finishedAt: new Date().toISOString(),
-        status,
-        rowsWritten: rows,
-        eventsWritten: events,
-        error: error ?? null,
-      });
+      try {
+        await store.recordRun({
+          sourceId: connector.id,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          status,
+          rowsWritten: rows,
+          eventsWritten: events,
+          error: error ?? null,
+        });
+      } catch (err) {
+        // The Sources tab reads `source_runs`; losing the row means a failure
+        // that happened leaves no mark on the dashboard at all. Say so loudly
+        // rather than letting the outcome quietly not exist.
+        logger.error('could not record the run', { err });
+      }
     }
     return { sourceId: connector.id, status, rows, events, durationMs, error, warnings };
   };
 
   if (connector.requiresKey && !process.env[connector.requiresKey] && !opts.force) {
+    logger.debug('skipped', { needs: connector.requiresKey });
     return finish('skipped', 0, 0, `missing ${connector.requiresKey}`);
   }
+
+  logger.debug('started', { since: opts.since, dryRun: opts.dryRun === true });
 
   const ctx: FetchCtx = {
     since: opts.since,
@@ -66,8 +78,9 @@ export async function runConnector(
       defaultCacheTtlHours: 12,
       userAgent: 'world-dashboard/0.1 (personal research dashboard)',
       noCache: opts.noCache,
+      logger: log,
     }),
-    log: (msg) => { logs.push(msg); },
+    log: (msg) => { logs.push(msg); logger.debug(msg); },
   };
 
   try {
@@ -83,9 +96,21 @@ export async function runConnector(
     await store.markSeriesSuccess(result.series.map((s) => s.id), new Date().toISOString());
 
     const status: RunStatus = result.warnings?.length ? 'partial' : 'ok';
+    if (status === 'partial') {
+      logger.warn('partial', { rows, events, warnings: result.warnings?.slice(0, 5) });
+    } else {
+      logger.info('ok', { rows, events, series: result.series.length, ms: Date.now() - t0 });
+    }
+    // A connector that ran clean and returned nothing is not an error, but it
+    // is the signature of an upstream that changed shape under a parser too
+    // tolerant to notice. It belongs in the log even when nothing failed.
+    if (status === 'ok' && rows === 0 && events === 0) {
+      logger.warn('returned no observations', { series: result.series.length, since: opts.since });
+    }
     return finish(status, rows, events, result.warnings?.join('; '), result.warnings);
   } catch (err) {
-    return finish('error', 0, 0, (err as Error).message);
+    logger.error('failed', { err, ms: Date.now() - t0, notes: logs.slice(-3) });
+    return finish('error', 0, 0, describeError(err).message);
   }
 }
 

@@ -1,4 +1,4 @@
-import type { Connector } from '@wd/core';
+import type { Connector, ConnectorHealth } from '@wd/core';
 import { fredConnector } from './fred.js';
 import { treasuryCurveConnector } from './treasury-curve.js';
 import { treasuryAuctionsConnector } from './treasury-auctions.js';
@@ -32,6 +32,24 @@ export const CONNECTORS: Connector[] = [
 
 export function getConnector(id: string): Connector | undefined {
   return CONNECTORS.find((c) => c.id === id);
+}
+
+/**
+ * The registry as the alert engine needs it, including whether each required
+ * key is actually present.
+ *
+ * Lives here rather than in the API and the CLI separately: a source the
+ * dashboard calls "disabled, no key" and the CLI calls "broken" is the kind of
+ * disagreement that makes an operator stop trusting both.
+ */
+export function connectorHealth(env: NodeJS.ProcessEnv = process.env): ConnectorHealth[] {
+  return CONNECTORS.map((c) => ({
+    id: c.id,
+    name: c.name,
+    optional: c.optional ?? false,
+    requiresKey: c.requiresKey ?? null,
+    keyPresent: c.requiresKey ? Boolean(env[c.requiresKey]) : true,
+  }));
 }
 
 export * from './util.js';

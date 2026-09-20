@@ -1,9 +1,11 @@
 import {
-  computeComposite, evaluateWatchlist, loadScoringConfig, todayIso,
+  computeComposite, evaluateWatchlist, loadScoringConfig, log, MIN_PILLAR_COVERAGE, todayIso,
   type CompositeScore, type Observation, type ScoreRecord, type Store, type WatchlistResult,
 } from '@wd/core';
 import { resolve } from 'node:path';
 import { ROOT } from './config.js';
+
+const logger = log.child('score');
 
 export interface ScoreOutcome {
   composite: CompositeScore;
@@ -50,6 +52,25 @@ export async function computeAndStoreScores(
     pillarWeights: config.pillarWeights,
   });
   const watchlist = evaluateWatchlist(data, asOfDate);
+
+  // The score is an average over whatever survived staleness filtering, and it
+  // looks identical whether that was every indicator or a third of them. These
+  // two lines are the difference between a quiet degradation and a visible one.
+  const excluded = composite.pillars.filter((p) => p.coverage < MIN_PILLAR_COVERAGE).map((p) => p.pillar);
+  logger.info('scored', {
+    asOf: asOfDate,
+    composite: Number.isFinite(composite.score) ? Math.round(composite.score * 10) / 10 : null,
+    regime: composite.regime,
+    coverage: Math.round(composite.coverage * 100) / 100,
+    seriesLoaded: data.size,
+    seriesRequested: new Set(ids).size,
+    triggered: watchlist.filter((w) => w.available && w.triggered).length,
+  });
+  if (!Number.isFinite(composite.score)) {
+    logger.error('composite could not be computed', { asOf: asOfDate, pillars: composite.pillars.length });
+  } else if (excluded.length > 0) {
+    logger.warn('pillars excluded for low coverage', { excluded, floor: MIN_PILLAR_COVERAGE });
+  }
 
   if (persist) {
     const records: ScoreRecord[] = [];

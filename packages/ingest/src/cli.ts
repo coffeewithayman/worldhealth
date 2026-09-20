@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 import {
-  SqliteStore, addDays, addYears, todayIso,
-  type CompositeScore, type Store, type WatchlistResult,
+  SqliteStore, addDays, addYears, collectAlerts, describeError, hasRunFailure, log,
+  summarizeAlerts, todayIso,
+  type Alert, type CompositeScore, type Store, type WatchlistResult,
 } from '@wd/core';
-import { CONNECTORS, getConnector } from '@wd/connectors';
+import { CONNECTORS, connectorHealth, getConnector } from '@wd/connectors';
 import { dbPath, loadEnv } from './config.js';
 import { runAll, type RunOutcome } from './runner.js';
-import { deriveAll } from './derive.js';
+import { deriveAll, type DeriveOutcome } from './derive.js';
 import { computeAndStoreScores } from './score.js';
+import { runStage, type StageResult } from './stage.js';
 
 const C = {
   reset: '\x1b[0m', dim: '\x1b[2m', bold: '\x1b[1m',
@@ -70,6 +72,59 @@ function summarise(results: RunOutcome[], dryRun = false): number {
   // Non-zero only on hard failure, so a cron wrapper can distinguish "a feed
   // broke" from "the whole run broke".
   return failed.length > 0 ? 1 : 0;
+}
+
+/** Connector outcomes in the shape `pipeline_runs` stores. */
+function ingestStageResult(results: RunOutcome[]): StageResult {
+  const failed = results.filter((r) => r.status === 'error');
+  return {
+    okCount: results.filter((r) => r.status === 'ok' || r.status === 'partial').length,
+    failCount: failed.length,
+    rowsWritten: results.reduce((a, r) => a + r.rows, 0),
+    failed: failed.map((f) => ({ id: f.sourceId, error: f.error ?? null })),
+    detail: {
+      skipped: results.filter((r) => r.status === 'skipped').map((r) => r.sourceId),
+      partial: results.filter((r) => r.status === 'partial').map((r) => r.sourceId),
+    },
+  };
+}
+
+function deriveStageResult(outcomes: DeriveOutcome[]): StageResult {
+  const failed = outcomes.filter((o) => o.status === 'error');
+  return {
+    okCount: outcomes.filter((o) => o.status === 'ok').length,
+    failCount: failed.length,
+    rowsWritten: outcomes.reduce((a, o) => a + o.rows, 0),
+    failed: failed.map((f) => ({ id: f.id, error: f.detail ?? null })),
+    detail: { skipped: outcomes.filter((o) => o.status === 'skipped').map((o) => o.id) },
+  };
+}
+
+const ALERT_MARK: Record<Alert['severity'], string> = {
+  critical: `${C.red}■${C.reset}`,
+  warning: `${C.yellow}▲${C.reset}`,
+  info: `${C.dim}·${C.reset}`,
+};
+
+/**
+ * The same alerts the dashboard renders, in the terminal.
+ *
+ * Deliberately the same `collectAlerts` call the API makes rather than a
+ * parallel set of CLI checks — a cron job that reports "all clear" while the
+ * page shows three failures is how an operator learns to ignore both.
+ */
+function printAlerts(alerts: Alert[]): void {
+  const sum = summarizeAlerts(alerts);
+  if (sum.total === 0) {
+    console.log(`\n  ${C.green}No open alerts${C.reset} ${C.dim}— pipeline current, no failed source, nothing past its refresh budget${C.reset}`);
+    return;
+  }
+  console.log(`\n${C.bold}Alerts${C.reset} ${C.dim}(${sum.critical} critical, ${sum.warning} warning, ${sum.info} info)${C.reset}\n`);
+  for (const a of alerts) {
+    console.log(`  ${ALERT_MARK[a.severity]} ${C.bold}${a.title}${C.reset}`);
+    console.log(`    ${C.dim}${a.detail}${C.reset}`);
+    if (a.action) console.log(`    ${C.cyan}→ ${a.action}${C.reset}`);
+  }
 }
 
 function bar(score: number, width = 24): string {
@@ -155,13 +210,18 @@ async function main(): Promise<void> {
       const connectors = selectConnectors(flags);
       // A 120-day lookback absorbs upstream revisions without refetching history.
       const since = flags.get('since') ?? addDays(todayIso(), -120);
+      const dryRun = flags.get('dry-run') === 'true';
       console.log(`${C.bold}Ingesting ${connectors.length} sources${C.reset} since ${since}\n`);
-      const results = await withStore((store) => runAll(
-        connectors, store,
-        { since, dryRun: flags.get('dry-run') === 'true', noCache: flags.get('no-cache') === 'true' },
-        4, printOutcome,
-      ));
-      process.exitCode = summarise(results);
+      const results = await withStore((store) => runStage(store, 'ingest', async () => {
+        const out = await runAll(
+          connectors, store,
+          { since, dryRun, noCache: flags.get('no-cache') === 'true' },
+          4, printOutcome,
+        );
+        // A dry run must not leave a row claiming the data was updated.
+        return { result: out, ...(dryRun ? { status: 'skipped' as const } : ingestStageResult(out)) };
+      }));
+      process.exitCode = summarise(results, dryRun);
       break;
     }
 
@@ -171,9 +231,10 @@ async function main(): Promise<void> {
       const since = flags.get('since') ?? addYears(todayIso(), -25);
       console.log(`${C.bold}Backfilling ${connectors.length} sources${C.reset} since ${since}`);
       console.log(`${C.dim}This can take a few minutes and will hit upstream rate limits if repeated.${C.reset}\n`);
-      const results = await withStore((store) => runAll(
-        connectors, store, { since }, 2, printOutcome,
-      ));
+      const results = await withStore((store) => runStage(store, 'backfill', async () => {
+        const out = await runAll(connectors, store, { since }, 2, printOutcome);
+        return { result: out, ...ingestStageResult(out) };
+      }));
       process.exitCode = summarise(results);
       break;
     }
@@ -181,22 +242,43 @@ async function main(): Promise<void> {
     case 'derive': {
       const since = flags.get('since') ?? '1900-01-01';
       await withStore(async (store) => {
-        const outcomes = await deriveAll(store, since);
+        const outcomes = await runStage(store, 'derive', async () => {
+          const out = await deriveAll(store, since);
+          return { result: out, ...deriveStageResult(out) };
+        });
         for (const o of outcomes) {
           const icon = o.status === 'ok' ? `${C.green}ok${C.reset}`
             : o.status === 'skipped' ? `${C.dim}skipped${C.reset}` : `${C.red}ERROR${C.reset}`;
           console.log(`  ${icon.padEnd(20)} ${o.id.padEnd(28)} ${o.rows ? `${o.rows} rows` : ''} ${C.dim}${o.detail ?? ''}${C.reset}`);
         }
         const ok = outcomes.filter((o) => o.status === 'ok').length;
+        const failed = outcomes.filter((o) => o.status === 'error');
         console.log(`\n${C.bold}${ok}/${outcomes.length} derivations computed${C.reset}`);
+        if (failed.length) console.log(`${C.red}${failed.length} failed${C.reset} — see the Sources tab or run with --no-cache`);
+        process.exitCode = failed.length > 0 ? 1 : 0;
       });
       break;
     }
 
     case 'score': {
       const asOf = flags.get('as-of') ?? todayIso();
+      const persist = flags.get('dry-run') !== 'true';
       await withStore(async (store) => {
-        const { composite, watchlist } = await computeAndStoreScores(store, asOf, flags.get('dry-run') !== 'true');
+        const { composite, watchlist } = await runStage(store, 'score', async () => {
+          const out = await computeAndStoreScores(store, asOf, persist);
+          return {
+            result: out,
+            okCount: out.composite.pillars.filter((p) => Number.isFinite(p.score)).length,
+            status: persist ? undefined : ('skipped' as const),
+            detail: {
+              asOf,
+              composite: Number.isFinite(out.composite.score) ? out.composite.score : null,
+              regime: out.composite.regime,
+              coverage: out.composite.coverage,
+              triggered: out.watchlist.filter((w) => w.available && w.triggered).map((w) => w.id),
+            },
+          };
+        });
         printScores(composite, watchlist, asOf);
       });
       break;
@@ -207,23 +289,85 @@ async function main(): Promise<void> {
       const since = flags.get('since') ?? addDays(todayIso(), -120);
       console.log(`${C.bold}Daily update${C.reset} ${C.dim}(ingest → derive → score)${C.reset}\n`);
       await withStore(async (store) => {
-        const results = await runAll(CONNECTORS, store, { since }, 4, printOutcome);
-        summarise(results);
+        // The outer stage is the proof the scheduler fired at all. Each inner
+        // stage records its own row, so a failure is attributable to the step
+        // that failed rather than to "the daily job".
+        await runStage(store, 'daily', async () => {
+          const results = await runStage(store, 'ingest', async () => {
+            const out = await runAll(CONNECTORS, store, { since }, 4, printOutcome);
+            return { result: out, ...ingestStageResult(out) };
+          });
+          summarise(results);
 
-        console.log(`\n${C.bold}Derived series${C.reset}`);
-        const derived = await deriveAll(store, '1900-01-01');
-        const okd = derived.filter((o) => o.status === 'ok').length;
-        const errd = derived.filter((o) => o.status === 'error');
-        console.log(`  ${okd}/${derived.length} computed`);
-        for (const e of errd) console.log(`  ${C.red}${e.id}: ${e.detail}${C.reset}`);
+          console.log(`\n${C.bold}Derived series${C.reset}`);
+          const derived = await runStage(store, 'derive', async () => {
+            const out = await deriveAll(store, '1900-01-01');
+            return { result: out, ...deriveStageResult(out) };
+          });
+          const okd = derived.filter((o) => o.status === 'ok').length;
+          const errd = derived.filter((o) => o.status === 'error');
+          console.log(`  ${okd}/${derived.length} computed`);
+          for (const e of errd) console.log(`  ${C.red}${e.id}: ${e.detail}${C.reset}`);
 
-        console.log(`\n${C.bold}Scoring${C.reset}`);
-        const { composite, watchlist } = await computeAndStoreScores(store, todayIso());
-        printScores(composite, watchlist, todayIso());
+          console.log(`\n${C.bold}Scoring${C.reset}`);
+          const { composite, watchlist } = await runStage(store, 'score', async () => {
+            const out = await computeAndStoreScores(store, todayIso());
+            return {
+              result: out,
+              okCount: out.composite.pillars.filter((p) => Number.isFinite(p.score)).length,
+              detail: {
+                asOf: todayIso(),
+                composite: Number.isFinite(out.composite.score) ? out.composite.score : null,
+                regime: out.composite.regime,
+                coverage: out.composite.coverage,
+              },
+            };
+          });
+          printScores(composite, watchlist, todayIso());
 
-        // Only a hard connector failure is worth a non-zero exit; degraded
-        // coverage is normal and already visible in the output.
-        process.exitCode = results.some((r) => r.status === 'error' && !getConnector(r.sourceId)?.optional) ? 1 : 0;
+          const ingestFailed = results.filter((r) => r.status === 'error');
+          const deriveFailed = errd;
+          return {
+            result: undefined,
+            okCount: results.filter((r) => r.status === 'ok').length + okd,
+            failCount: ingestFailed.length + deriveFailed.length,
+            rowsWritten: results.reduce((a, r) => a + r.rows, 0) + derived.reduce((a, d) => a + d.rows, 0),
+            failed: [
+              ...ingestFailed.map((r) => ({ id: r.sourceId, error: r.error ?? null })),
+              ...deriveFailed.map((d) => ({ id: d.id, error: d.detail ?? null })),
+            ],
+            detail: { composite: Number.isFinite(composite.score) ? composite.score : null, regime: composite.regime },
+          };
+        });
+
+        // The run ends with the same list the dashboard shows, so whoever reads
+        // the cron output and whoever opens the page see one story.
+        const alerts = await collectAlerts(store, { connectors: connectorHealth() });
+        printAlerts(alerts);
+
+        // Only a failure of *this run* is worth a non-zero exit. Long-standing
+        // staleness is critical on the page but would otherwise leave the
+        // systemd unit red every night until somebody fixed an upstream they
+        // do not control.
+        process.exitCode = hasRunFailure(alerts) ? 1 : 0;
+      });
+      break;
+    }
+
+    case 'alerts': {
+      // Read-only: the operational view of the same state the dashboard renders.
+      await withStore(async (store) => {
+        const alerts = await collectAlerts(store, { connectors: connectorHealth() });
+        printAlerts(alerts);
+        const runs = await store.getLatestPipelineRuns();
+        if (runs.length > 0) {
+          console.log(`\n${C.bold}Last run of each stage${C.reset}`);
+          for (const r of runs) {
+            const tone = r.status === 'ok' ? C.green : r.status === 'error' ? C.red : C.yellow;
+            console.log(`  ${tone}${r.status.padEnd(8)}${C.reset} ${r.stage.padEnd(10)} ${C.dim}${r.startedAt} · ${r.okCount} ok, ${r.failCount} failed, ${r.rowsWritten} rows${C.reset}`);
+          }
+        }
+        process.exitCode = summarizeAlerts(alerts).critical > 0 ? 1 : 0;
       });
       break;
     }
@@ -254,6 +398,7 @@ ${C.bold}world-dashboard ingest CLI${C.reset}
   ${C.cyan}score${C.reset}                   Compute composite, pillar and watchlist scores
   ${C.cyan}daily${C.reset}                   ingest → derive → score (the scheduler entrypoint)
   ${C.cyan}health${C.reset}                  Report stale series
+  ${C.cyan}alerts${C.reset}                  What is broken and what to run (exit 1 on anything critical)
 
 ${C.bold}Flags${C.reset}
   --only <id,id>          Restrict to named connectors
@@ -261,11 +406,20 @@ ${C.bold}Flags${C.reset}
   --dry-run               Fetch and parse without writing
   --no-cache              Bypass the raw response cache
   --as-of <YYYY-MM-DD>    Score as of a past date (point-in-time, for backtests)
+
+${C.bold}Logging${C.reset} ${C.dim}(structured, on stderr — stdout stays the report above)${C.reset}
+  WD_LOG_LEVEL=debug|info|warn|error|silent
+  WD_LOG_FORMAT=text|json          Defaults to text on a terminal, json otherwise
+  WD_LOG_FILE=/path/to/run.log     Append every line here as well
 `);
   }
 }
 
 main().catch((err) => {
-  console.error(`${C.red}Fatal:${C.reset}`, err instanceof Error ? err.message : err);
+  // A crash here is a crash of the CLI itself — a stage that threw has already
+  // recorded its own `pipeline_runs` row on the way past, so the dashboard
+  // knows about it even though this process is about to stop existing.
+  log.error('fatal', { err });
+  console.error(`${C.red}Fatal:${C.reset}`, describeError(err).message);
   process.exit(1);
 });

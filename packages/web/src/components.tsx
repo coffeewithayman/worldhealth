@@ -1,9 +1,9 @@
 import { useMemo } from 'react';
 import {
   SCORE_BANDS, statusFor, STATUS_COLOR, statusLabel,
-  type Change, type Point, type RiseMeaning, type Status,
+  type Alert, type AlertSeverity, type Change, type Point, type RiseMeaning, type Status,
 } from './api';
-import { fmtPct, fmtRangeEnd, fmtSigned, fmtValue } from './format';
+import { fmtDateShort, fmtPct, fmtRangeEnd, fmtSigned, fmtValue } from './format';
 
 /* ---------------------------------------------------------------- sparkline */
 
@@ -257,6 +257,68 @@ export function SectionHead({ title, aside, children }: {
       {aside && <div className="aside">{aside}</div>}
       {children}
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ alerts */
+
+const ALERT_ICON: Record<AlertSeverity, string> = { critical: '■', warning: '▲', info: '·' };
+
+/**
+ * The list of things that need doing.
+ *
+ * Every row ends in a command. The reason is the whole premise of this panel: a
+ * dashboard that says "3 sources are stale" and stops has moved the problem
+ * from the data to the reader, who now has to remember which command fixes it.
+ *
+ * Severity drives the left rule and the mark, never the text colour — a
+ * paragraph in alarm red is harder to read exactly when reading it matters.
+ */
+export function AlertPanel({ alerts, limit, onShowAll, title = 'Needs attention' }: {
+  alerts: Alert[];
+  /** Show at most this many, with a link to the rest. */
+  limit?: number;
+  onShowAll?: () => void;
+  title?: string;
+}) {
+  if (alerts.length === 0) return null;
+  const shown = limit ? alerts.slice(0, limit) : alerts;
+  const hidden = alerts.length - shown.length;
+  const counts = [
+    alerts.filter((a) => a.severity === 'critical').length && `${alerts.filter((a) => a.severity === 'critical').length} critical`,
+    alerts.filter((a) => a.severity === 'warning').length && `${alerts.filter((a) => a.severity === 'warning').length} warning`,
+    alerts.filter((a) => a.severity === 'info').length && `${alerts.filter((a) => a.severity === 'info').length} info`,
+  ].filter(Boolean).join(' · ');
+
+  return (
+    <section className="card flush alerts" aria-label={title}>
+      <div className="alerts-head">
+        <span className="card-title" style={{ margin: 0 }}>{title}</span>
+        <span className="muted small">{counts}</span>
+      </div>
+      <ul className="alert-list">
+        {shown.map((a) => (
+          <li key={a.id} className={`alert alert-${a.severity}`}>
+            <span className="alert-mark" aria-hidden="true">{ALERT_ICON[a.severity]}</span>
+            <div className="alert-body">
+              <div className="alert-title">{a.title}</div>
+              <div className="alert-detail">{a.detail}</div>
+              {a.action && (
+                <code className="alert-action mono" title="Run this to fix it">{a.action}</code>
+              )}
+            </div>
+            <span className="alert-since small muted">{a.since ? fmtDateShort(a.since.slice(0, 10)) : ''}</span>
+          </li>
+        ))}
+      </ul>
+      {hidden > 0 && (
+        <div className="alerts-more">
+          <button onClick={onShowAll} style={{ color: 'var(--series-1)' }}>
+            {hidden} more {hidden === 1 ? 'alert' : 'alerts'} →
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
 

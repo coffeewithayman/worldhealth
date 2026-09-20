@@ -112,7 +112,17 @@ export default function App() {
   }
 
   const activeTab: View['name'] = view.name === 'pillar' ? 'overview' : view.name === 'series' ? 'overview' : view.name;
-  const stale = (dash?.health.staleSeries ?? 0) > 0;
+  // The pill reports the worst open alert rather than the stale count alone:
+  // a pipeline that has not run for three days leaves every series inside its
+  // budget for a while, and "All feeds current" would be a lie throughout.
+  const summary = dash?.alertSummary;
+  const worst = summary?.worst ?? null;
+  const pillClass = worst === 'critical' ? ' alarm' : worst === 'warning' ? ' stale' : '';
+  const pillText = !summary || summary.total === 0
+    ? 'All feeds current'
+    : summary.critical > 0
+      ? `${summary.critical} critical`
+      : `${summary.warning + summary.info} to check`;
 
   return (
     <div className="app">
@@ -140,9 +150,13 @@ export default function App() {
         <div className="spacer" />
 
         {dash && (
-          <span className={`live-dot${stale ? ' stale' : ''}`}>
-            {stale ? `${dash.health.staleSeries} stale` : 'All feeds current'} · {fmtDate(dash.asOf)}
-          </span>
+          <button
+            className={`live-dot${pillClass}`}
+            onClick={() => setView({ name: 'sources' })}
+            title={summary && summary.total > 0 ? 'Open the Sources tab for the full list' : 'Every feed is inside its refresh budget'}
+          >
+            {pillText} · {fmtDate(dash.asOf)}
+          </button>
         )}
         <button
           className="icon-button"
@@ -165,6 +179,7 @@ export default function App() {
               onOpenPillar={openPillar}
               onOpenSeries={openSeries}
               onOpenMarkets={() => setView({ name: 'markets' })}
+              onOpenSources={() => setView({ name: 'sources' })}
             />
           )}
           {view.name === 'markets' && (

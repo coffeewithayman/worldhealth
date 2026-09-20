@@ -1,15 +1,52 @@
-import { Hono } from 'hono';
+import { Hono, type Context, type ErrorHandler } from 'hono';
 import { cors } from 'hono/cors';
 import {
-  addDays, asOf as valueAsOfDate, BOARD, boardSeriesIds, computeComposite, computeQuoteStats,
-  CURVE_POINTS, evaluateWatchlist, HEADLINE_ROWS, indexSeries, isRateUnit, loadScoringConfig, todayIso,
-  type BoardRow, type Observation, type QuoteStats, type Store,
+  addDays, asOf as valueAsOfDate, BOARD, boardSeriesIds, collectAlerts, computeComposite,
+  computeQuoteStats, CURVE_POINTS, describeError, evaluateWatchlist, HEADLINE_ROWS, indexSeries,
+  isRateUnit, loadScoringConfig, log, summarizeAlerts, todayIso,
+  type BoardRow, type Observation, type PillarCoverage, type QuoteStats, type Store,
 } from '@wd/core';
-import { CONNECTORS } from '@wd/connectors';
+import { CONNECTORS, connectorHealth } from '@wd/connectors';
 
 export interface ApiDeps {
   store: Store;
   configPath: string;
+}
+
+const logger = log.child('api');
+
+/**
+ * The error handler for every route.
+ *
+ * Exported because a Hono sub-app's `onError` is not inherited by the app it is
+ * mounted into: `server.ts` has to install this one too, or a thrown route
+ * lands on Hono's default handler, which logs nothing and returns a bare 500
+ * the dashboard cannot explain to the reader.
+ */
+export const apiErrorHandler: ErrorHandler = (err, c) => {
+  const e = describeError(err);
+  logger.error('route threw', { err, path: c.req.path, method: c.req.method });
+  return c.json({
+    error: e.message,
+    // Named so the UI can say "the API failed" rather than "no data", which is
+    // the distinction that decides whether the reader retries or investigates.
+    kind: 'server_error',
+    path: c.req.path,
+  }, 500);
+};
+
+/** Timing and outcome for every API call. Quiet on success, loud otherwise. */
+async function requestLog(c: Context, next: () => Promise<void>): Promise<void> {
+  const t0 = Date.now();
+  await next();
+  const ms = Date.now() - t0;
+  const fields = { method: c.req.method, path: c.req.path, status: c.res.status, ms };
+  if (c.res.status >= 500) logger.error('request failed', fields);
+  else if (c.res.status >= 400) logger.warn('request rejected', fields);
+  // A dashboard request that takes seconds is the early sign of a series that
+  // has grown past what loading whole history per request can carry.
+  else if (ms > 2000) logger.warn('slow request', fields);
+  else logger.debug('request', fields);
 }
 
 /**
@@ -27,6 +64,8 @@ export interface ApiDeps {
 export function createRoutes(deps: ApiDeps): Hono {
   const app = new Hono();
   app.use('/api/*', cors());
+  app.use('/api/*', requestLog);
+  app.onError(apiErrorHandler);
 
   const seriesCache = new Map<string, Observation[]>();
   const loadSeries = async (ids: string[]): Promise<Map<string, Observation[]>> => {
@@ -41,6 +80,16 @@ export function createRoutes(deps: ApiDeps): Hono {
     }
     return out;
   };
+
+  /**
+   * Operational alerts, from the same `collectAlerts` the CLI calls.
+   *
+   * `pillars` is passed only where a composite has just been computed — an
+   * excluded pillar is a scoring consequence, and recomputing the whole model
+   * to mention it on an endpoint that is not about scoring would be backwards.
+   */
+  const alertsFor = (pillars?: PillarCoverage[]) =>
+    collectAlerts(deps.store, { connectors: connectorHealth(), pillars });
 
   const WATCHLIST_SERIES = [
     'ust.spread.10y2y', 'd.curve_steepening_90d', 'us.hy_oas', 'd.m2_yoy',
@@ -59,6 +108,10 @@ export function createRoutes(deps: ApiDeps): Hono {
     const history = await deps.store.getScoreHistory('composite');
     const health = await deps.store.getSeriesHealth();
     const runs = await deps.store.getLatestRuns();
+    const pipeline = await deps.store.getLatestPipelineRuns();
+    const alerts = await alertsFor(composite.pillars.map((p) => ({
+      pillar: p.pillar, coverage: p.coverage, missing: p.missing,
+    })));
 
     const staleSeries = health.filter((h) => h.stale);
     return c.json({
@@ -78,6 +131,12 @@ export function createRoutes(deps: ApiDeps): Hono {
       })),
       watchlist,
       compositeHistory: history,
+      // Everything the reader needs to know about whether to believe the
+      // numbers above. Shipped with the primary payload rather than behind a
+      // second request, so there is no window where the page shows a score
+      // without showing that the pipeline feeding it is broken.
+      alerts,
+      alertSummary: summarizeAlerts(alerts),
       health: {
         totalSeries: health.length,
         staleSeries: staleSeries.length,
@@ -85,6 +144,10 @@ export function createRoutes(deps: ApiDeps): Hono {
         // a broken feed has to be visible on the page itself.
         stale: staleSeries.slice(0, 40),
         runs,
+        pipeline,
+        lastUpdate: pipeline
+          .filter((r) => r.stage === 'daily' || r.stage === 'ingest' || r.stage === 'backfill')
+          .sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0] ?? null,
       },
     });
   });
@@ -309,10 +372,38 @@ export function createRoutes(deps: ApiDeps): Hono {
         lastRun: null,
       });
     }
-    return c.json({ sources });
+    const alerts = await alertsFor();
+    return c.json({
+      sources,
+      alerts,
+      alertSummary: summarizeAlerts(alerts),
+      pipeline: await deps.store.getPipelineRuns(undefined, 20),
+    });
   });
 
-  app.get('/api/health', (c) => c.json({ ok: true, ts: new Date().toISOString() }));
+  /** Alerts on their own, for polling and for anything outside the dashboard. */
+  app.get('/api/alerts', async (c) => {
+    const alerts = await alertsFor();
+    return c.json({ alerts, summary: summarizeAlerts(alerts), ts: new Date().toISOString() });
+  });
+
+  /**
+   * Liveness plus a one-line verdict on the data.
+   *
+   * Stays 200 while the process is serving — a monitor asking "is the API up"
+   * must not get a 503 because a feed is stale. `summary.critical` is the field
+   * to alert on, and it is one hop away.
+   */
+  app.get('/api/health', async (c) => {
+    const pipeline = await deps.store.getLatestPipelineRuns();
+    const alerts = await alertsFor();
+    return c.json({
+      ok: true,
+      ts: new Date().toISOString(),
+      summary: summarizeAlerts(alerts),
+      lastRun: pipeline[0] ?? null,
+    });
+  });
 
   return app;
 }
