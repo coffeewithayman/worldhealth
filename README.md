@@ -365,7 +365,7 @@ today's.
 ## Testing
 
 ```bash
-npm test        # 33 tests: transforms, point-in-time discipline, aggregation,
+npm test        # 35 tests: transforms, point-in-time discipline, aggregation,
                 #           watchlist, quote statistics, board integrity
 npm run doctor  # probe every upstream source, write nothing
 ```
