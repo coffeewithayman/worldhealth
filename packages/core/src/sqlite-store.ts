@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { SCHEMA_STATEMENTS } from './schema.js';
+import { ADDED_COLUMNS, SCHEMA_STATEMENTS } from './schema.js';
 import type { CachedResponse, EventFilter, SeriesFilter, Store } from './store.js';
 import type {
   Cadence, IsoDate, Observation, Pillar, PipelineRun, PipelineStage, ScoreKind, ScoreRecord,
@@ -12,7 +12,7 @@ import { daysBetween, todayIso } from './dates.js';
 interface SeriesRow {
   id: string; name: string; unit: string; cadence: string; source_id: string;
   pillar: string | null; source_url: string | null; notes: string | null;
-  staleness_budget_days: number;
+  staleness_budget_days: number; retired_at: string | null;
 }
 
 function toSeriesDef(r: SeriesRow): SeriesDef {
@@ -26,6 +26,7 @@ function toSeriesDef(r: SeriesRow): SeriesDef {
     sourceUrl: r.source_url ?? undefined,
     notes: r.notes ?? undefined,
     stalenessBudgetDays: r.staleness_budget_days,
+    retiredAt: r.retired_at ?? undefined,
   };
 }
 
@@ -67,13 +68,20 @@ export class SqliteStore implements Store {
 
   async migrate(): Promise<void> {
     for (const stmt of SCHEMA_STATEMENTS) this.db.exec(stmt);
+    // `CREATE TABLE IF NOT EXISTS` leaves an existing table untouched, so a
+    // column added after a database was created only arrives this way.
+    for (const c of ADDED_COLUMNS) {
+      const existing = this.db.prepare(`PRAGMA table_info(${c.table})`).all() as Array<{ name: string }>;
+      if (existing.some((col) => col.name === c.column)) continue;
+      this.db.exec(`ALTER TABLE ${c.table} ADD COLUMN ${c.column} ${c.definition}`);
+    }
   }
 
   async upsertSeries(defs: SeriesDef[]): Promise<void> {
     if (defs.length === 0) return;
     const stmt = this.db.prepare(`
-      INSERT INTO series (id, name, unit, cadence, source_id, pillar, source_url, notes, staleness_budget_days)
-      VALUES (@id, @name, @unit, @cadence, @source_id, @pillar, @source_url, @notes, @staleness_budget_days)
+      INSERT INTO series (id, name, unit, cadence, source_id, pillar, source_url, notes, staleness_budget_days, retired_at)
+      VALUES (@id, @name, @unit, @cadence, @source_id, @pillar, @source_url, @notes, @staleness_budget_days, @retired_at)
       ON CONFLICT (id) DO UPDATE SET
         name = excluded.name,
         unit = excluded.unit,
@@ -82,7 +90,8 @@ export class SqliteStore implements Store {
         pillar = excluded.pillar,
         source_url = excluded.source_url,
         notes = excluded.notes,
-        staleness_budget_days = excluded.staleness_budget_days
+        staleness_budget_days = excluded.staleness_budget_days,
+        retired_at = excluded.retired_at
     `);
     const run = this.db.transaction((rows: SeriesDef[]) => {
       for (const d of rows) {
@@ -96,6 +105,7 @@ export class SqliteStore implements Store {
           source_url: d.sourceUrl ?? null,
           notes: d.notes ?? null,
           staleness_budget_days: d.stalenessBudgetDays,
+          retired_at: d.retiredAt ?? null,
         });
       }
     });
@@ -255,18 +265,20 @@ export class SqliteStore implements Store {
     const rows = this.db.prepare(`
       SELECT s.id AS series_id,
              s.staleness_budget_days,
+             s.retired_at,
              h.last_obs_date,
              h.last_success_at
       FROM series s
       LEFT JOIN series_health h ON h.series_id = s.id
       ORDER BY s.id
     `).all() as Array<{
-      series_id: string; staleness_budget_days: number;
+      series_id: string; staleness_budget_days: number; retired_at: string | null;
       last_obs_date: string | null; last_success_at: string | null;
     }>;
     const today = todayIso();
     return rows.map((r) => {
       const ageDays = r.last_obs_date ? daysBetween(r.last_obs_date, today) : null;
+      const retired = r.retired_at !== null;
       return {
         seriesId: r.series_id,
         lastObsDate: r.last_obs_date,
@@ -274,8 +286,12 @@ export class SqliteStore implements Store {
         stalenessBudgetDays: r.staleness_budget_days,
         ageDays,
         // No data at all counts as stale — a series that never loaded should
-        // never be silently treated as fresh.
-        stale: ageDays === null || ageDays > r.staleness_budget_days,
+        // never be silently treated as fresh. A retired one is the opposite
+        // case: it has all the data it will ever have, so its age is a fact
+        // rather than a fault and must not raise an alert.
+        stale: !retired && (ageDays === null || ageDays > r.staleness_budget_days),
+        retired,
+        retiredAt: r.retired_at,
       };
     });
   }

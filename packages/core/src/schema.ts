@@ -16,7 +16,8 @@ export const SCHEMA_STATEMENTS: string[] = [
     pillar                TEXT,
     source_url            TEXT,
     notes                 TEXT,
-    staleness_budget_days INTEGER NOT NULL DEFAULT 7
+    staleness_budget_days INTEGER NOT NULL DEFAULT 7,
+    retired_at            TEXT
   )`,
 
   `CREATE INDEX IF NOT EXISTS idx_series_source ON series (source_id)`,
@@ -105,4 +106,25 @@ export const SCHEMA_STATEMENTS: string[] = [
   )`,
 
   `CREATE INDEX IF NOT EXISTS idx_raw_cache_source ON raw_cache (source_id, fetched_at DESC)`,
+];
+
+/**
+ * Columns added to a table that already exists in the wild.
+ *
+ * `CREATE TABLE IF NOT EXISTS` above does nothing to a database created before
+ * a column was introduced, so every new column has to be declared here too or
+ * it only ever reaches fresh checkouts. Kept as data rather than DDL because
+ * the "add it only if it is missing" spelling is the one piece of schema
+ * handling that genuinely differs between SQLite, Postgres and D1 — each store
+ * applies this list in its own dialect, and the list itself stays portable.
+ */
+export interface AddedColumn {
+  table: string;
+  column: string;
+  /** Type and any default, exactly as it appears after the column name. */
+  definition: string;
+}
+
+export const ADDED_COLUMNS: AddedColumn[] = [
+  { table: 'series', column: 'retired_at', definition: 'TEXT' },
 ];

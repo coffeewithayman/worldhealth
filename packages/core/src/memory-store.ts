@@ -125,13 +125,16 @@ export class MemoryStore implements Store {
         const dates = [...(this.obs.get(s.id)?.keys() ?? [])].sort();
         const lastObsDate = dates.at(-1) ?? null;
         const ageDays = lastObsDate ? daysBetween(lastObsDate, today) : null;
+        const retired = s.retiredAt !== undefined;
         return {
           seriesId: s.id,
           lastObsDate,
           lastSuccessAt: this.health.get(s.id)?.lastSuccessAt ?? null,
           stalenessBudgetDays: s.stalenessBudgetDays,
           ageDays,
-          stale: ageDays === null || ageDays > s.stalenessBudgetDays,
+          stale: !retired && (ageDays === null || ageDays > s.stalenessBudgetDays),
+          retired,
+          retiredAt: s.retiredAt ?? null,
         };
       });
   }

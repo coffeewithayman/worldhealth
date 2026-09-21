@@ -1,4 +1,5 @@
 import { strict as assert } from 'node:assert';
+import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -164,6 +165,36 @@ forEachStore('a series with no observations at all counts as stale', async (stor
   assert.equal(h!.lastObsDate, null);
 });
 
+forEachStore('a retired series reports its end date and is never stale', async (store) => {
+  // FRED discontinued us.nonperforming_loans after 2020-07-01. Its history is
+  // still worth keeping and still scores in an --as-of backtest inside that
+  // window, but it must stop raising an alert nothing can act on.
+  await store.upsertSeries([series('x.retired', { retiredAt: '2020-07-01', stalenessBudgetDays: 230 })]);
+  await store.putObservations([{ seriesId: 'x.retired', obsDate: '2020-07-01', value: 1.06 }]);
+  // SqliteStore derives last_obs_date in markSeriesSuccess, which is the step
+  // the real pipeline runs after a connector writes; MemoryStore reads the
+  // observations directly. Calling it keeps the two comparable.
+  await store.markSeriesSuccess(['x.retired'], '2026-09-20T00:00:00.000Z');
+
+  const [h] = await store.getSeriesHealth();
+  assert.equal(h!.retired, true);
+  assert.equal(h!.retiredAt, '2020-07-01');
+  assert.equal(h!.stale, false, 'a series that has ended is complete, not broken');
+  assert.ok((h!.ageDays ?? 0) > 230, 'its age is still reported — it is a fact, not a fault');
+
+  assert.equal((await store.getSeries('x.retired'))?.retiredAt, '2020-07-01');
+});
+
+forEachStore('retirement can be lifted by an upsert, like any other field', async (store) => {
+  // A series wrongly marked dead must come back on the next ingest rather than
+  // needing someone to go and edit the database by hand.
+  await store.upsertSeries([series('x.back', { retiredAt: '2020-07-01' })]);
+  await store.upsertSeries([series('x.back')]);
+  const [h] = await store.getSeriesHealth();
+  assert.equal(h!.retired, false);
+  assert.equal(h!.retiredAt, null);
+});
+
 /* ----------------------------------------------------------------- migrate */
 
 test('migrate is idempotent, so an existing database picks up a new table', async () => {
@@ -183,4 +214,35 @@ test('migrate is idempotent, so an existing database picks up a new table', asyn
   await second.migrate();
   assert.equal((await second.getPipelineRuns()).length, 1, 'migrating again must not wipe what is there');
   await second.close();
+});
+
+test('migrate adds a column to a series table that predates it', async () => {
+  // `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists,
+  // so without the additive-column pass a new column reaches fresh checkouts
+  // only — and the upsert that writes it fails everywhere else.
+  const dir = mkdtempSync(join(tmpdir(), 'wd-store-'));
+  dirs.push(dir);
+  const path = join(dir, 'test.db');
+
+  const legacy = new Database(path);
+  legacy.exec(`CREATE TABLE series (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, unit TEXT NOT NULL, cadence TEXT NOT NULL,
+    source_id TEXT NOT NULL, pillar TEXT, source_url TEXT, notes TEXT,
+    staleness_budget_days INTEGER NOT NULL DEFAULT 7
+  )`);
+  legacy.prepare(
+    `INSERT INTO series (id, name, unit, cadence, source_id, staleness_budget_days)
+     VALUES ('x.old', 'Old', 'index', 'daily', 'fred', 7)`,
+  ).run();
+  legacy.close();
+
+  const store = new SqliteStore(path);
+  await store.migrate();
+  await store.upsertSeries([series('x.new', { retiredAt: '2020-07-01' })]);
+
+  const ids = (await store.listSeries()).map((s) => s.id);
+  assert.deepEqual(ids, ['x.new', 'x.old'], 'the pre-existing row survives the upgrade');
+  assert.equal((await store.getSeries('x.new'))?.retiredAt, '2020-07-01');
+  assert.equal((await store.getSeries('x.old'))?.retiredAt, undefined);
+  await store.close();
 });

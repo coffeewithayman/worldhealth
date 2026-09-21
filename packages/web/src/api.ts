@@ -31,6 +31,13 @@ export interface SeriesHealth {
   ageDays: number | null;
   stalenessBudgetDays: number;
   stale: boolean;
+  /**
+   * Discontinued upstream. Optional because a bundle can outlive the server
+   * that would send it, and the page must render the same either way — an
+   * older API simply reports the series as not retired.
+   */
+  retired?: boolean;
+  retiredAt?: string | null;
 }
 
 export type AlertSeverity = 'critical' | 'warning' | 'info';
