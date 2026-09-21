@@ -147,3 +147,35 @@ test('an unknown pillar or series is a 404 with a message, not a crash', async (
   assert.equal(series.status, 404);
   assert.match(series.body.error, /nope\.nope/);
 });
+
+/* ------------------------------------------------------------ freshness */
+
+test('a long-running server picks up new data once the pipeline records a run', async () => {
+  // The series cache used to live for the life of the process, so a
+  // production API kept serving the numbers it loaded at boot after every
+  // daily run until it happened to restart.
+  const store = new MemoryStore();
+  const get = app(store);
+  await store.upsertSeries([seriesDef('fx.broad_dollar', 'fred')]);
+  await store.putObservations([{ seriesId: 'fx.broad_dollar', obsDate: '2026-09-01', value: 111.111 }]);
+  await store.recordPipelineRun(pipelineRun());
+  assert.match(JSON.stringify((await get('/api/markets')).body), /111\.111/);
+
+  await store.putObservations([{ seriesId: 'fx.broad_dollar', obsDate: '2026-09-02', value: 222.222 }]);
+  const now = new Date().toISOString();
+  await store.recordPipelineRun(pipelineRun({ startedAt: now, finishedAt: now }));
+  assert.match(JSON.stringify((await get('/api/markets')).body), /222\.222/, 'the new run invalidates the cache');
+});
+
+/* ---------------------------------------------------------------- healthz */
+
+test('/healthz is 200 when the database answers and 503 when it does not', async () => {
+  // The platform's deploy healthcheck. It must depend on the database and on
+  // nothing else — a stale feed must never roll back a good release.
+  const store = new MemoryStore();
+  assert.deepEqual(await app(store)('/healthz'), { status: 200, body: { ok: true } });
+  store.ping = async () => { throw new Error('connection refused'); };
+  const down = await app(store)<{ ok: boolean }>('/healthz');
+  assert.equal(down.status, 503);
+  assert.equal(down.body.ok, false);
+});

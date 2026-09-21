@@ -1,16 +1,18 @@
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
-import { log } from '@wd/core';
+import { defaultConfigPath, loadEnv, log, REPO_ROOT } from '@wd/core';
 import { describeStoreTarget, openStore, resolveStoreTarget } from '@wd/store';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { relative, resolve } from 'node:path';
 import { apiErrorHandler, createRoutes } from './routes.js';
 
 const logger = log.child('server');
 
-const ROOT = resolve(import.meta.dirname, '../../..');
-const configPath = process.env.WD_CONFIG_PATH ?? resolve(ROOT, 'config/indicators.yaml');
+// Keys in .env.local reach the API too, so the Sources tab reports the same
+// key status as `npm run sources`. On a platform neither file exists.
+loadEnv();
+const configPath = defaultConfigPath();
 const port = Number(process.env.PORT ?? 8787);
 
 const target = resolveStoreTarget();
@@ -37,10 +39,13 @@ app.onError(apiErrorHandler);
 
 // Serve the built dashboard when it exists; in development Vite serves it
 // instead and proxies /api here.
-const webDist = resolve(ROOT, 'packages/web/dist');
+// serveStatic resolves against the cwd, so the path is made relative to
+// wherever the process was started rather than assuming the repo root.
+const webDist = resolve(REPO_ROOT, 'packages/web/dist');
 if (existsSync(webDist)) {
-  app.use('/*', serveStatic({ root: 'packages/web/dist' }));
-  app.get('*', serveStatic({ path: 'packages/web/dist/index.html' }));
+  const root = relative(process.cwd(), webDist) || '.';
+  app.use('/*', serveStatic({ root }));
+  app.get('*', serveStatic({ path: `${root}/index.html` }));
 }
 
 serve({ fetch: app.fetch, port }, (info) => {

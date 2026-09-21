@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import {
-  addDays, collectAlerts, describeError, hasRunFailure, log,
+  addDays, collectAlerts, describeError, hasRunFailure, loadEnv, log,
   summarizeAlerts, todayIso,
   type Alert, type CompositeScore, type Store, type WatchlistResult,
 } from '@wd/core';
@@ -8,7 +8,6 @@ import {
   PostgresStore, SqliteStore, copyStore, createCache, describeStoreTarget, openStore, resolveStoreTarget,
 } from '@wd/store';
 import { CONNECTORS, connectorHealth, getConnector } from '@wd/connectors';
-import { loadEnv } from './config.js';
 import { runAll, type RunOutcome } from './runner.js';
 import { backfillSince, pendingBackfills, recordBackfill, runPendingBackfills } from './backfill.js';
 import { deriveAll, type DeriveOutcome } from './derive.js';
@@ -433,7 +432,7 @@ async function main(): Promise<void> {
 
         // Only a failure of *this run* is worth a non-zero exit. Long-standing
         // staleness is critical on the page but would otherwise leave the
-        // systemd unit red every night until somebody fixed an upstream they
+        // scheduled job red every night until somebody fixed an upstream they
         // do not control.
         process.exitCode = hasRunFailure(alerts) ? 1 : 0;
       });

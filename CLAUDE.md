@@ -16,9 +16,8 @@ npm run sources        # connector list + which are disabled for a missing key
 npm run alerts         # what is broken and the command that fixes it; exit 1 if critical
 npm run api            # Hono server on :8787
 npm run dev            # api + Vite dev server (:5173, proxies /api to :8787)
-npm run snapshot       # build web + render every API response into dist-cloudflare/
-npm run cf:preview     # snapshot, then wrangler dev
-npm run cf:deploy      # snapshot, then wrangler deploy — the ONLY way prod changes
+docker compose up --build      # production shape locally: Postgres + MinIO + API on :8787
+docker compose run --rm cron   # one daily run against it
 ```
 
 Postgres and S3 contract tests run only when their env vars are set (each case gets its own schema / key prefix):
@@ -38,12 +37,11 @@ npm run build && node --test --test-name-pattern="FIMA repo bands" packages/core
 
 Things the npm scripts do not cover:
 
-- **`npm run build` does not build the web bundle.** The root `tsconfig.json` references only core, connectors, ingest and api. `npm run api` serves `packages/web/dist` only if it exists — build it with `npm -w @wd/web run build`, or use `npm run dev` instead.
+- **`npm run build` does not build the web bundle.** The root `tsconfig.json` references only core, store, connectors, ingest and api (the Dockerfile and CI build web explicitly). `npm run api` serves `packages/web/dist` only if it exists — build it with `npm -w @wd/web run build`, or use `npm run dev` instead.
 - **Web is type-checked separately**: `npm -w @wd/web exec tsc -- --noEmit`. Nothing in `npm run build` or `npm test` catches a type error in `packages/web`.
 - **`derive` and `health` are CLI subcommands with no npm script**: `node packages/ingest/dist/cli.js derive` (recompute derived series without refetching), `... health` (list stale series).
-- `npm run api` exits if `data/world.db` is absent — migrate first.
+- `npm run api` on SQLite exits if `data/world.db` is absent — migrate first. On Postgres an empty database is legitimate (the first `daily` fills it).
 - **`npm run migrate` is rarely needed on its own.** `withStore()` in `ingest/src/cli.ts` calls `store.migrate()` on every CLI invocation, and the API calls it at boot, so `daily` applies a new column before the ingest that writes it. It exists as the explicit deploy step.
-- **`npm run snapshot` needs `data/world.db`**, because it renders the real routes against the real database. It cannot run anywhere the 300 MB gitignored DB is absent — which is why there is no deploy-on-push.
 
 CLI flags (ingest/backfill/doctor/score): `--only <id,id>`, `--since YYYY-MM-DD`, `--dry-run`, `--no-cache`, `--as-of YYYY-MM-DD` (point-in-time scoring, for backtests).
 
@@ -61,12 +59,14 @@ packages/store/          SqliteStore, PostgresStore, migrations.ts, copy.ts, cre
                          cache.ts (FsCache, S3Cache, createCache — the raw response cache)
 packages/connectors/     one module per upstream source, uniform Connector interface
 packages/ingest/         CLI: migrate, doctor, ingest, backfill, derive, score, daily, health
-packages/api/            Hono routes (routes.ts) + server.ts (Node) + snapshot.ts and
-                         worker.ts (Cloudflare read path)
+packages/api/            Hono routes (routes.ts) + server.ts (Node; also serves packages/web/dist)
 packages/web/            React + Vite, hash routing, hand-rolled SVG charts
-wrangler.jsonc           Worker config: one ASSETS binding, no secrets, no nodejs_compat
+Dockerfile               one image, two roles: API (default CMD) or `cli.js daily`
+railway.api.toml         Railway config-as-code: pre-deploy migrate, /healthz
+railway.cron.toml        Railway config-as-code: daily at 07:20 UTC, restart NEVER
+docker-compose.yml       local prod parity (postgres:16, MinIO, api, cron profile)
+.github/workflows/ci.yml build, web typecheck, tests on Postgres + MinIO, image smoke test
 data/world.db            local SQLite (gitignored); DATABASE_URL=postgres://… selects Postgres
-dist-cloudflare/         generated snapshot — web bundle + api/*.json (gitignored)
 ```
 
 **Everything is a time series.** Every connector — SDMX, ArcGIS, XML, CSV, JSON — normalises to `Observation { seriesId, obsDate, value }`. Storage, scoring, charting and staleness are written once, not once per source. Resist any design that needs a source-specific path through the pipeline.
@@ -75,15 +75,13 @@ dist-cloudflare/         generated snapshot — web bundle + api/*.json (gitigno
 
 **Series-id namespaces** are by origin, not by pillar: `us.` `em.` `fx.` `metal.` `oil.` `gas.` `cmd.` `semi.` `mkt.` `crypto.` (connector-written), `ust.` (Treasury curve), and `d.` for everything derived. A `d.` id that no derivation produces silently scores nothing.
 
-**Deployment is split, and the split is the thing to remember.** Cloudflare serves the **read path only**: a Worker (`api/src/worker.ts`) over a Static Assets bundle holding the web build plus one JSON file per API response. The **write path — ingest → derive → score — does not run on Cloudflare at all**; it is the same Node CLI on the local systemd timer (`scripts/install-timer.sh`), writing to the local `data/world.db`. This is fallback #2 from `docs/deploy-cloudflare.md` §7, taken because three free-plan limits (rows read per request, rows written per day, subrequests per invocation) rule out the on-platform pipeline in §2–§4.
+**Deployment: merging to `main` is the deploy.** Production is one Docker image run as two Railway services — `worldhealth-api` (`railway.api.toml`) and `worldhealth-cron` (`railway.cron.toml`) — over Postgres (`DATABASE_URL`), with the raw response cache in an S3-compatible bucket (`WD_CACHE_URL`). `docs/deploy-railway.md` is the runbook. The design goal is that nothing in production is edited by hand after the one-off `copy-store`:
 
-Consequences worth holding in mind before changing anything:
-
-- **A commit changes nothing in production.** There is deliberately no deploy-on-push: Workers Builds cannot run a build that needs the 300 MB gitignored `data/world.db`, and a commit is the wrong trigger anyway — the data changes daily, the code does not. `npm run cf:deploy` is the only thing that moves prod, and it must run somewhere the database exists. The README points at the systemd `ExecStartPost=` hook as the right place to automate it.
-- **Prod freshness is downstream of the local timer.** A snapshot is only as current as the last `daily` run that fed it. If the timer is not firing, redeploying just republishes the same stale numbers.
-- **`snapshot.ts` drives the real routes** through Hono's `app.request()`, so the published bytes are what `npm run api` serves by construction. Never reassemble a payload by hand there — that is a second implementation of the dashboard, and the one that drifts.
-- **The Worker imports nothing.** No `@wd/core`, no Hono, hence no `nodejs_compat`. Keep it that way; it is what makes the bundle 2 KiB and free of Node built-ins.
-- A new API route needs adding to `snapshot.ts`'s route list as well as to `routes.ts`, or it 404s in prod while working perfectly under `npm run api`.
+- **Every production change is code.** Schema → a migration (applied by the API's pre-deploy `migrate`). New source or catalogue entry → merged; the next `daily` backfills it (`series_backfill`). Weights → `config/indicators.yaml`, read live per request. Only API keys live outside the repo, as service variables.
+- **The app knows nothing about Railway.** It reads env vars only; Railway specifics are confined to the two toml files. Keep it that way — a platform check in application code is what would make the next move a rewrite. Portability notes for Fly/Render/VPS/k8s are in the runbook §2.
+- **`/healthz` is the deploy gate; `/api/health` is not.** `/healthz` pings the database and nothing else. `/api/health` runs the alert engine and must never decide whether a release goes live — a stale upstream feed would roll back a good deploy.
+- **Migrations must be additive to keep rollback safe.** A Railway rollback runs the previous image against the already-migrated schema. New columns nullable/defaulted; drop things a release later.
+- **The API caches whole series, versioned by `pipeline_runs`.** `loadSeries` in `routes.ts` clears its cache when the newest pipeline run changes, so a long-running server picks up each `daily` without a restart. Anything that writes observations outside a recorded stage (e.g. `copy-store`) is only visible after a restart or the next run.
 
 **Ordering:** `DERIVATIONS` order is semantic — a derivation may read a series computed earlier in the same pass (`d.gold_breadth` needs the per-currency `d.gold.*` above it). The `CONNECTORS` registry order is cosmetic only; connectors run concurrently.
 
@@ -110,7 +108,7 @@ These are enforced by tests and by deliberate design; breaking one is usually a 
 - **Credentials never reach a log, an error or the DB.** `core/src/http.ts` `redactUrl()` strips key-ish query params; connector errors are persisted to `source_runs.error` and served by `/api/sources`.
 - **The raw response cache is replayability, not performance.** It keeps verbatim upstream bodies so a parsing bug can be fixed and re-run against yesterday's exact bytes without burning a free-tier quota. `--no-cache` skips the read. It is a `ResponseCache` (`core/src/cache.ts`), **not part of `Store`**, and lives where `WD_CACHE_URL` says — `data/cache/` by default, an S3-compatible bucket in production (`S3Cache` signs with `aws4fetch`; keep it off the AWS SDK). `Http` treats a cache failure as a miss plus a warning; a dry run gets a `NullCache`; `daily` prunes past `WD_CACHE_RETENTION_DAYS`. Migration 3 dropped the old `raw_cache` table.
 - **Quote arithmetic is server-side** in `core/src/quotes.ts` — change windows, 52-week range, 5-year percentile, sparkline. A change window shorter than the series' publication gap is omitted rather than forward-filled, and rate-like units report basis points, not a percent of a percent.
-- **The API scores live from `config/indicators.yaml`** on each request; the `scores` table is only read for *history*. Editing weights shows up on refresh without re-running the scorer. **This holds for `npm run api` only.** The Cloudflare deployment serves a precomputed snapshot built by `npm run snapshot`, so there a weight edit changes nothing until `npm run cf:deploy` re-runs it, and `?as_of=` is ignored rather than honoured. Backtests are a local concern. See `docs/deploy-cloudflare.md` §5 and §11.
+- **The API scores live from `config/indicators.yaml`** on each request; the `scores` table is only read for *history*. Editing weights shows up on refresh without re-running the scorer. This holds in production too (weights ship with a deploy), and `?as_of=` backtests work against the production API.
 - **`WATCHLIST_SERIES` is duplicated** in `packages/api/src/routes.ts` and `packages/ingest/src/score.ts`. A new watchlist rule needs both lists updated or the API and CLI disagree.
 
 ## Adding things

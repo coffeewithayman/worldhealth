@@ -1,8 +1,17 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-/** Repo root, resolved from this file's location so the CLI works from any cwd. */
-export const ROOT = resolve(import.meta.dirname, '../../..');
+/**
+ * Repo root, resolved from this file's location (`packages/core/dist`), so
+ * the CLI and the API work from any cwd — and in the container, where the
+ * image keeps the same layout under /app.
+ */
+export const REPO_ROOT = resolve(import.meta.dirname, '../../..');
+
+/** The model. Read at runtime, so a weight edit ships with the next deploy. */
+export function defaultConfigPath(): string {
+  return process.env.WD_CONFIG_PATH ?? resolve(REPO_ROOT, 'config/indicators.yaml');
+}
 
 /**
  * Load `.env.local` then `.env` into `process.env` without adding a dependency.
@@ -11,11 +20,12 @@ export const ROOT = resolve(import.meta.dirname, '../../..');
  * `.env.local` (machine-specific, gitignored) overrides the shared `.env`.
  *
  * An empty value is treated as absent, so a placeholder line left over from
- * `.env.example` in one file does not mask a real key in the other.
+ * `.env.example` in one file does not mask a real key in the other. In a
+ * container neither file exists and the platform's variables are all there is.
  */
-export function loadEnv(): void {
+export function loadEnv(root = REPO_ROOT): void {
   for (const name of ['.env.local', '.env']) {
-    const path = resolve(ROOT, name);
+    const path = resolve(root, name);
     if (!existsSync(path)) continue;
     for (const line of readFileSync(path, 'utf8').split('\n')) {
       const trimmed = line.trim();

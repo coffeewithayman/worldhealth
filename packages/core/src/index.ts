@@ -3,6 +3,7 @@ export * from './store.js';
 export * from './cache.js';
 export * from './memory-store.js';
 export * from './log.js';
+export * from './env.js';
 export * from './dates.js';
 export * from './stats.js';
 export * from './http.js';

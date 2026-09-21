@@ -1,0 +1,16 @@
+# Railway config-as-code for the daily pipeline (ingest → backfill new series
+# → derive → score). Same image as the API; it runs, exits, and waits for the
+# next firing. Point the service at this file: Settings → Config-as-code →
+# railway.cron.toml. Variables as for the API service.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "node packages/ingest/dist/cli.js daily"
+# 07:20 UTC daily. Railway cron is UTC.
+cronSchedule = "20 7 * * *"
+# A cron job must exit rather than be restarted on completion; a non-zero
+# exit is a failed run in Railway's view, the same verdict pipeline_runs holds.
+restartPolicyType = "NEVER"
