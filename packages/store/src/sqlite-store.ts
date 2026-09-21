@@ -12,6 +12,7 @@ import { MIGRATIONS, MIGRATIONS_TABLE_DDL, type MigrationContext } from './migra
 /** Tables `copy-store` carries across, in dependency-free order. */
 export const COPYABLE_TABLES = [
   'series', 'observations', 'source_runs', 'pipeline_runs', 'series_health', 'scores', 'events',
+  'series_backfill',
 ] as const;
 
 interface SeriesRow {
@@ -341,6 +342,22 @@ export class SqliteStore implements Store {
         retiredAt: r.retired_at,
       };
     });
+  }
+
+  async getBackfilledSeries(): Promise<Set<string>> {
+    const rows = this.db.prepare('SELECT series_id FROM series_backfill').all() as Array<{ series_id: string }>;
+    return new Set(rows.map((r) => r.series_id));
+  }
+
+  async markBackfilled(seriesIds: string[], at: string, since: IsoDate): Promise<void> {
+    if (seriesIds.length === 0) return;
+    const stmt = this.db.prepare(`
+      INSERT INTO series_backfill (series_id, backfilled_at, since)
+      VALUES (?, ?, ?)
+      ON CONFLICT (series_id) DO UPDATE SET backfilled_at = excluded.backfilled_at, since = excluded.since
+    `);
+    const run = this.db.transaction((ids: string[]) => { for (const id of ids) stmt.run(id, at, since); });
+    run(seriesIds);
   }
 
   async putScores(scores: ScoreRecord[]): Promise<void> {

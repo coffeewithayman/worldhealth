@@ -9,8 +9,8 @@ npm run build          # tsc --build (project references); every other script ru
 npm test               # builds, then node --test over packages/*/dist/**/*.test.js
 npm run migrate        # apply pending migrations to DATABASE_URL (Postgres) or data/world.db
 npm run copy-store -- --from <world.db>   # one-off: SQLite history → Postgres at DATABASE_URL
-npm run backfill       # deep history (25y default) — needed before percentile scoring is meaningful
-npm run daily          # ingest → derive → score; the scheduler entrypoint
+npm run backfill       # deep history (25y default); daily also backfills never-backfilled series itself
+npm run daily          # ingest → backfill new series → derive → score; the scheduler entrypoint
 npm run doctor         # probe every upstream source, write nothing (fastest triage)
 npm run sources        # connector list + which are disabled for a missing key
 npm run alerts         # what is broken and the command that fixes it; exit 1 if critical
@@ -115,7 +115,7 @@ These are enforced by tests and by deliberate design; breaking one is usually a 
 
 ## Adding things
 
-**A data source:** write one module in `packages/connectors/src/` exporting a `Connector`, append it to `CONNECTORS` in `index.ts`. Nothing else changes. Declare series inline (connectors own their own metadata) and set `stalenessBudgetDays` from publication lag. Use the shared `util.ts` parsers — `num()` returns null rather than NaN for the many "no data" spellings, because NaN corrupts percentile ranks silently.
+**A data source:** write one module in `packages/connectors/src/` exporting a `Connector`, append it to `CONNECTORS` in `index.ts`. Nothing else changes — `daily` backfills any connector series missing from `series_backfill` (`ingest/src/backfill.ts`), so merging is the whole deploy. If the source fetches per series, honour `ctx.seriesIds` (see FRED/EIA) so backfilling one new entry is one request; a source that returns everything at once can ignore it. Declare series inline (connectors own their own metadata) and set `stalenessBudgetDays` from publication lag. Use the shared `util.ts` parsers — `num()` returns null rather than NaN for the many "no data" spellings, because NaN corrupts percentile ranks silently.
 
 **An indicator:** commit `f668663` is the template to follow — connector catalog entry, `config/indicators.yaml` block with a justified transform, a test pinning the behaviour that would break if the transform were swapped, and a README line. Verify against live data at two dates (a quiet one and a known firing) before committing.
 

@@ -50,6 +50,14 @@ export interface Store {
   markSeriesSuccess(seriesIds: string[], at: string): Promise<void>;
   getSeriesHealth(): Promise<SeriesHealth[]>;
 
+  /**
+   * Series whose deep history has been loaded. A series missing from this set
+   * is fetched from `since` 25 years back on the next `daily` — which is how a
+   * source or catalogue entry added in code fills itself in production.
+   */
+  getBackfilledSeries(): Promise<Set<string>>;
+  markBackfilled(seriesIds: string[], at: string, since: IsoDate): Promise<void>;
+
   putScores(scores: ScoreRecord[]): Promise<void>;
   getScores(scoreDate: IsoDate): Promise<ScoreRecord[]>;
   getLatestScoreDate(): Promise<IsoDate | null>;

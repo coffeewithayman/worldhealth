@@ -20,7 +20,7 @@ import { resolveStoreTarget } from './index.js';
  * stops meaning anything.
  *
  * Postgres cases run when `WD_TEST_DATABASE_URL` points at a server (CI sets
- * it; locally: `docker compose up -d postgres`). Each case gets its own schema.
+ * it; locally see the README's Testing section). Each case gets its own schema.
  */
 const PG_URL = process.env.WD_TEST_DATABASE_URL;
 const dirs: string[] = [];
@@ -303,6 +303,33 @@ forEachStore('ping succeeds on an open store', async (store) => {
   await store.ping();
 });
 
+forEachStore('backfill records round-trip and can be updated', async (store) => {
+  assert.deepEqual([...await store.getBackfilledSeries()], []);
+  await store.markBackfilled(['x.a', 'x.b', 'x.a'], '2026-09-21T00:00:00.000Z', '2001-09-21');
+  await store.markBackfilled(['x.b'], '2026-09-22T00:00:00.000Z', '2001-09-22');
+  assert.deepEqual([...await store.getBackfilledSeries()].sort(), ['x.a', 'x.b']);
+});
+
+test('migration 4 counts series with deep history as already backfilled', async () => {
+  // Otherwise the first daily after upgrading refetches 25 years of all 300
+  // series. Deep = reaches back more than 400 days; a short series is simply
+  // backfilled once. Exercised the way it happens: a pre-versioning database
+  // with history, opened by the new code.
+  const path = tmpDb();
+  const legacy = new Database(path);
+  legacy.exec(`CREATE TABLE observations (
+    series_id TEXT NOT NULL, obs_date TEXT NOT NULL, value REAL NOT NULL,
+    PRIMARY KEY (series_id, obs_date))`);
+  legacy.exec(`INSERT INTO observations VALUES
+    ('x.deep', '2001-01-01', 1), ('x.deep', '2026-09-01', 2), ('x.shallow', '2026-06-01', 3)`);
+  legacy.close();
+
+  const store = new SqliteStore(path);
+  await store.migrate();
+  assert.deepEqual([...await store.getBackfilledSeries()], ['x.deep']);
+  await store.close();
+});
+
 /* ----------------------------------------------------------------- migrate */
 
 forEachSqlStore('migrate records every migration once, and a re-run applies nothing', async (make) => {
@@ -347,6 +374,7 @@ if (PG_URL) {
       status: 'ok', rowsWritten: 2, eventsWritten: 0, error: null,
     });
     await src.putScores([{ scoreDate: '2026-09-19', key: 'composite', kind: 'composite', value: 41.2, inputs: { a: 1 } }]);
+    await src.markBackfilled(['x.a'], '2026-09-19T00:00:00.000Z', '2001-09-19');
 
     const dst = pgStore();
     await dst.migrate();
@@ -362,6 +390,7 @@ if (PG_URL) {
       assert.equal((await dst.getSeriesHealth())[0]?.lastObsDate, '2020-07-01');
       assert.equal((await dst.getScores('2026-09-19'))[0]?.value, 41.2);
       assert.equal((await dst.getLatestRuns())[0]?.sourceId, 'fred');
+      assert.deepEqual([...await dst.getBackfilledSeries()], ['x.a'], 'or prod would backfill everything again');
       // Identity advanced past the copied ids, so the next insert does not collide.
       await dst.recordPipelineRun(pipelineRun({ startedAt: '2026-09-20T06:00:00.000Z' }));
       assert.equal((await dst.getPipelineRuns()).length, 2);

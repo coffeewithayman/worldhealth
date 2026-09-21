@@ -25,6 +25,7 @@ export class MemoryStore implements Store {
   private health = new Map<string, { lastSuccessAt: string }>();
   private scores = new Map<string, ScoreRecord>();
   private events = new Map<string, WorldEvent>();
+  private backfilled = new Map<string, { at: string; since: IsoDate }>();
   closed = false;
 
   async migrate(): Promise<void> { /* nothing to create */ }
@@ -138,6 +139,14 @@ export class MemoryStore implements Store {
           retiredAt: s.retiredAt ?? null,
         };
       });
+  }
+
+  async getBackfilledSeries(): Promise<Set<string>> {
+    return new Set(this.backfilled.keys());
+  }
+
+  async markBackfilled(seriesIds: string[], at: string, since: IsoDate): Promise<void> {
+    for (const id of seriesIds) this.backfilled.set(id, { at, since });
   }
 
   async putScores(scores: ScoreRecord[]): Promise<void> {

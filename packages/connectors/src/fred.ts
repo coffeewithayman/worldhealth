@@ -280,7 +280,7 @@ export const fredConnector: Connector = {
 
     // A retired series has no more observations coming, so fetching it would
     // spend a request to be told nothing and then warn about the silence.
-    const live = CATALOG.filter((s) => !s.retired);
+    const live = CATALOG.filter((s) => !s.retired && (!ctx.seriesIds || ctx.seriesIds.has(s.id)));
     const retired = CATALOG.filter((s) => s.retired);
 
     // FRED permits 120 requests/minute. Six at a time with this catalogue keeps

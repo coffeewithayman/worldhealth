@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import {
-  addDays, addYears, collectAlerts, describeError, hasRunFailure, log,
+  addDays, collectAlerts, describeError, hasRunFailure, log,
   summarizeAlerts, todayIso,
   type Alert, type CompositeScore, type Store, type WatchlistResult,
 } from '@wd/core';
@@ -10,6 +10,7 @@ import {
 import { CONNECTORS, connectorHealth, getConnector } from '@wd/connectors';
 import { loadEnv } from './config.js';
 import { runAll, type RunOutcome } from './runner.js';
+import { backfillSince, pendingBackfills, recordBackfill, runPendingBackfills } from './backfill.js';
 import { deriveAll, type DeriveOutcome } from './derive.js';
 import { computeAndStoreScores } from './score.js';
 import { runStage, type StageResult } from './stage.js';
@@ -277,7 +278,7 @@ async function main(): Promise<void> {
     case 'backfill': {
       const connectors = selectConnectors(flags);
       // Percentile transforms need decades to be meaningful; default to 25 years.
-      const since = flags.get('since') ?? addYears(todayIso(), -25);
+      const since = flags.get('since') ?? backfillSince();
       const dryRun = flags.get('dry-run') === 'true';
       console.log(`${C.bold}Backfilling ${connectors.length} sources${C.reset} since ${since}`);
       console.log(`${C.dim}This can take a few minutes and will hit upstream rate limits if repeated.${C.reset}\n`);
@@ -287,6 +288,9 @@ async function main(): Promise<void> {
           { since, dryRun, noCache: flags.get('no-cache') === 'true', cache: createCache() },
           2, printOutcome,
         );
+        // Recorded so `daily` does not backfill the same series again. A
+        // short `--since` is recorded too: it was asked for explicitly.
+        if (!dryRun) for (const o of out) await recordBackfill(store, o, since);
         // A dry run must not leave a row claiming the data was updated.
         return { result: out, ...(dryRun ? { status: 'skipped' as const } : ingestStageResult(out)) };
       }));
@@ -355,6 +359,22 @@ async function main(): Promise<void> {
           });
           summarise(results);
 
+          // A source or catalogue entry added in code arrives here: ingest has
+          // just declared its series with 120 days of data, and nothing has
+          // recorded a backfill for them yet. Only recorded as a stage when
+          // there was something to do, so a quiet day adds no noise.
+          const { outcomes: backfilled, pendingSeries } = await (async () => {
+            const pending = await pendingBackfills(store, CONNECTORS);
+            if (pending.size === 0) return { outcomes: [] as RunOutcome[], pendingSeries: 0 };
+            console.log(`\n${C.bold}Backfilling new series${C.reset} ${C.dim}(${[...pending.values()].flat().length} series from ${[...pending.keys()].join(', ')})${C.reset}`);
+            return runStage(store, 'backfill', async () => {
+              const out = await runPendingBackfills(store, CONNECTORS, { cache, onResult: printOutcome });
+              return { result: out, ...ingestStageResult(out.outcomes) };
+            });
+          })();
+          if (pendingSeries === 0) console.log(`\n${C.dim}No new series to backfill${C.reset}`);
+          const backfillFailed = backfilled.filter((r) => r.status === 'error');
+
           console.log(`\n${C.bold}Derived series${C.reset}`);
           const derived = await runStage(store, 'derive', async () => {
             const out = await deriveAll(store, '1900-01-01');
@@ -381,13 +401,13 @@ async function main(): Promise<void> {
           });
           printScores(composite, watchlist, todayIso());
 
-          const ingestFailed = results.filter((r) => r.status === 'error');
+          const ingestFailed = [...results, ...backfillFailed].filter((r) => r.status === 'error');
           const deriveFailed = errd;
           return {
             result: undefined,
             okCount: results.filter((r) => r.status === 'ok').length + okd,
             failCount: ingestFailed.length + deriveFailed.length,
-            rowsWritten: results.reduce((a, r) => a + r.rows, 0) + derived.reduce((a, d) => a + d.rows, 0),
+            rowsWritten: [...results, ...backfilled].reduce((a, r) => a + r.rows, 0) + derived.reduce((a, d) => a + d.rows, 0),
             failed: [
               ...ingestFailed.map((r) => ({ id: r.sourceId, error: r.error ?? null })),
               ...deriveFailed.map((d) => ({ id: d.id, error: d.detail ?? null })),
@@ -463,7 +483,7 @@ ${C.bold}world-dashboard ingest CLI${C.reset}
   ${C.cyan}backfill${C.reset}                Load deep history (default 25 years)
   ${C.cyan}derive${C.reset}                  Recompute derived series from stored data
   ${C.cyan}score${C.reset}                   Compute composite, pillar and watchlist scores
-  ${C.cyan}daily${C.reset}                   ingest → derive → score (the scheduler entrypoint)
+  ${C.cyan}daily${C.reset}                   ingest → backfill new series → derive → score (the scheduler entrypoint)
   ${C.cyan}health${C.reset}                  Report stale series
   ${C.cyan}alerts${C.reset}                  What is broken and what to run (exit 1 on anything critical)
 

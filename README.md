@@ -107,9 +107,9 @@ keys in `.env.local`.
 | `npm run sources` | List connectors and their key status |
 | `npm run doctor` | Probe every source without writing — fastest way to spot a missing key or a changed upstream API |
 | `npm run ingest` | Incremental fetch (last 120 days, absorbing revisions) |
-| `npm run backfill` | Deep history load (default 25 years) |
+| `npm run backfill` | Deep history load (default 25 years). Rarely needed by hand: `daily` backfills any series that has never been backfilled |
 | `npm run score` | Recompute composite, pillar and watchlist scores |
-| `npm run daily` | **ingest → derive → score** — the scheduler entrypoint |
+| `npm run daily` | **ingest → backfill new series → derive → score** — the scheduler entrypoint |
 | `npm run alerts` | What is currently broken and what to run. Exits 1 if anything is critical |
 | `npm run api` | Serve the API and the built dashboard |
 | `npm run dev` | API + Vite dev server with hot reload |
@@ -333,7 +333,13 @@ ArcGIS, XML, CSV, JSON), normalises to `(series_id, date, value)`. Storage, scor
 charting and staleness are then written once rather than once per source.
 
 **Adding a source** means writing one module and appending it to the registry in
-`packages/connectors/src/index.ts`. Nothing else changes.
+`packages/connectors/src/index.ts`. Nothing else changes — including in
+production, where there is no one to run `npm run backfill`. `daily` does it: after
+its 120-day ingest it looks for connector series with no row in `series_backfill`
+(a new source, or a new entry in an existing catalogue), fetches 25 years for them,
+and records them as done. Sources that fetch per series (FRED, EIA) fetch only the
+new ones. A failed attempt records nothing and is retried the next day. The same
+mechanism is why an empty production database fills itself on its first run.
 
 **Connector failures are isolated.** One broken feed must never abort the other
 thirty. Every outcome — including failure — is written to `source_runs`, which is

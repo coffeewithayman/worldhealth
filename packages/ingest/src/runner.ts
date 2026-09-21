@@ -11,6 +11,8 @@ export interface RunOptions {
   force?: boolean;
   /** Where raw responses are kept. Omitted means nothing is cached. */
   cache?: ResponseCache;
+  /** Passed to the connector as `FetchCtx.seriesIds`. */
+  seriesIds?: ReadonlySet<string>;
 }
 
 export interface RunOutcome {
@@ -21,6 +23,8 @@ export interface RunOutcome {
   durationMs: number;
   error?: string;
   warnings?: string[];
+  /** Series the connector declared and that were written — what a backfill may mark done. */
+  seriesIds?: string[];
 }
 
 /**
@@ -42,6 +46,7 @@ export async function runConnector(
 
   const finish = async (
     status: RunStatus, rows: number, events: number, error?: string, warnings?: string[],
+    seriesIds?: string[],
   ): Promise<RunOutcome> => {
     const durationMs = Date.now() - t0;
     if (!opts.dryRun) {
@@ -62,7 +67,7 @@ export async function runConnector(
         logger.error('could not record the run', { err });
       }
     }
-    return { sourceId: connector.id, status, rows, events, durationMs, error, warnings };
+    return { sourceId: connector.id, status, rows, events, durationMs, error, warnings, seriesIds };
   };
 
   if (connector.requiresKey && !process.env[connector.requiresKey] && !opts.force) {
@@ -74,6 +79,7 @@ export async function runConnector(
 
   const ctx: FetchCtx = {
     since: opts.since,
+    seriesIds: opts.seriesIds,
     today: todayIso(),
     env: process.env,
     // A dry run must not write anything, and the cache is a write: `doctor`
@@ -111,7 +117,7 @@ export async function runConnector(
     if (status === 'ok' && rows === 0 && events === 0) {
       logger.warn('returned no observations', { series: result.series.length, since: opts.since });
     }
-    return finish(status, rows, events, result.warnings?.join('; '), result.warnings);
+    return finish(status, rows, events, result.warnings?.join('; '), result.warnings, result.series.map((s) => s.id));
   } catch (err) {
     logger.error('failed', { err, ms: Date.now() - t0, notes: logs.slice(-3) });
     return finish('error', 0, 0, describeError(err).message);

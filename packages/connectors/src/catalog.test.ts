@@ -113,3 +113,31 @@ test('retired series are declared but never fetched', async () => {
     globalThis.fetch = realFetch;
   }
 });
+
+test('FRED fetches only the requested series when given a filter', async () => {
+  // How a new catalogue entry is backfilled: one request, not ninety-odd.
+  const requested: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL) => {
+    const id = new URL(String(url)).searchParams.get('series_id');
+    if (id) requested.push(id);
+    return new Response(JSON.stringify({ observations: [{ date: '2001-01-01', value: '1.0' }] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const target = FRED_CATALOG.find((s) => !s.retired)!;
+    const result = await fredConnector.run({
+      since: '2001-09-21',
+      today: '2026-09-21',
+      seriesIds: new Set([target.id]),
+      http: new Http(new NullCache(), 'fred', {
+        defaultCacheTtlHours: 0, userAgent: 'test', noCache: true, logger: createLogger('test', { level: 'silent' }),
+      }),
+      env: { FRED_API_KEY: 'test-key' },
+      log: () => {},
+    });
+    assert.deepEqual(requested, [target.fred]);
+    assert.ok(result.series.some((s) => s.id === target.id));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

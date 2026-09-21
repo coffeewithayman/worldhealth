@@ -416,6 +416,26 @@ export class PostgresStore implements Store {
     });
   }
 
+  async getBackfilledSeries(): Promise<Set<string>> {
+    const { rows } = await this.pool.query<{ series_id: string }>('SELECT series_id FROM series_backfill');
+    return new Set(rows.map((r) => r.series_id));
+  }
+
+  async markBackfilled(seriesIds: string[], at: string, since: IsoDate): Promise<void> {
+    if (seriesIds.length === 0) return;
+    const ids = [...new Set(seriesIds)];
+    await this.tx(async (c) => {
+      for (const part of chunks(ids)) {
+        await c.query(
+          `INSERT INTO series_backfill (series_id, backfilled_at, since)
+           SELECT id, $2, $3 FROM unnest($1::text[]) AS ids(id)
+           ON CONFLICT (series_id) DO UPDATE SET backfilled_at = excluded.backfilled_at, since = excluded.since`,
+          [part, at, since],
+        );
+      }
+    });
+  }
+
   async putScores(scores: ScoreRecord[]): Promise<void> {
     if (scores.length === 0) return;
     const rows = lastWins(scores, (s) => `${s.scoreDate}\u0000${s.key}`);

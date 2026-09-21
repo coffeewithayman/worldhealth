@@ -183,6 +183,30 @@ export const MIGRATIONS: Migration[] = [
       await ctx.exec('DROP TABLE IF EXISTS raw_cache');
     },
   },
+  {
+    id: 4,
+    name: 'series_backfill',
+    // Which series have had their deep history loaded. `daily` backfills any
+    // connector series missing from here, so a source added in code fills in
+    // on its own. Seeded with every series that already reaches back more
+    // than 400 days — the local database was backfilled by hand, and treating
+    // all of it as pending would refetch 25 years of everything once. A
+    // genuinely short series is simply backfilled once, which is harmless.
+    async up(ctx) {
+      const { TEXT } = types(ctx.dialect);
+      await ctx.exec(`CREATE TABLE IF NOT EXISTS series_backfill (
+        series_id     ${TEXT} PRIMARY KEY,
+        backfilled_at ${TEXT} NOT NULL,
+        since         ${TEXT} NOT NULL
+      )`);
+      const now = new Date();
+      const cutoff = new Date(now.getTime() - 400 * 86_400_000).toISOString().slice(0, 10);
+      await ctx.exec(`INSERT INTO series_backfill (series_id, backfilled_at, since)
+        SELECT series_id, '${now.toISOString()}', MIN(obs_date) FROM observations
+        GROUP BY series_id HAVING MIN(obs_date) <= '${cutoff}'
+        ON CONFLICT (series_id) DO NOTHING`);
+    },
+  },
 ];
 
 /** The table `migrate()` records applied ids in. Identical in both dialects. */
