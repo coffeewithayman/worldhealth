@@ -136,6 +136,22 @@ test('scrubbing leaves ordinary environment values alone', () => {
   }
 });
 
+test('a database password never reaches a line, in a URL or on its own', () => {
+  // DATABASE_URL carries the Postgres password but matches none of the
+  // KEY/TOKEN/SECRET names, so it has to be named explicitly.
+  const before = process.env.DATABASE_URL;
+  process.env.DATABASE_URL = 'postgres://app:s3cr3t-pass-word@db.internal:5432/wd';
+  try {
+    const out = scrubSecrets(`connect failed: ${process.env.DATABASE_URL} (postgres://other:hunter2hunter2@h/x)`);
+    assert.doesNotMatch(out, /s3cr3t-pass-word/);
+    assert.doesNotMatch(out, /hunter2hunter2/, 'any URL userinfo, not only the one in the environment');
+    assert.match(out, /postgres:\/\/other:REDACTED@h\/x/, 'the host stays readable for debugging');
+  } finally {
+    if (before === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = before;
+  }
+});
+
 /* -------------------------------------------------------------- environment */
 
 test('the level is read per line, so .env loaded after import still applies', () => {

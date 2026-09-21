@@ -29,12 +29,16 @@ npm run build
 
 cp .env.example .env.local   # optional but strongly recommended — see "API keys"
 
-npm run migrate           # create the SQLite schema
+npm run migrate           # apply schema migrations (local SQLite unless DATABASE_URL is set)
 npm run backfill          # load deep history (needed for percentile scoring)
 npm run daily             # ingest → derive → score
 
 npm run api               # http://localhost:8787
 ```
+
+That is the local, zero-setup path: SQLite in `data/world.db`. For the production
+shape (Postgres, an S3 bucket, the Docker image) see
+[Deployment](#deployment).
 
 `npm run dev` runs the API and the Vite dev server together with hot reload.
 
@@ -102,19 +106,17 @@ keys in `.env.local`.
 
 | Command | What it does |
 |---|---|
-| `npm run migrate` | Apply the database schema |
+| `npm run migrate` | Apply pending schema migrations — the deploy step |
+| `npm run copy-store -- --from <world.db>` | One-off: copy a local SQLite database into the Postgres at `DATABASE_URL` |
 | `npm run sources` | List connectors and their key status |
 | `npm run doctor` | Probe every source without writing — fastest way to spot a missing key or a changed upstream API |
 | `npm run ingest` | Incremental fetch (last 120 days, absorbing revisions) |
-| `npm run backfill` | Deep history load (default 25 years) |
+| `npm run backfill` | Deep history load (default 25 years). Rarely needed by hand: `daily` backfills any series that has never been backfilled |
 | `npm run score` | Recompute composite, pillar and watchlist scores |
-| `npm run daily` | **ingest → derive → score** — the scheduler entrypoint |
+| `npm run daily` | **ingest → backfill new series → derive → score** — the scheduler entrypoint |
 | `npm run alerts` | What is currently broken and what to run. Exits 1 if anything is critical |
 | `npm run api` | Serve the API and the built dashboard |
 | `npm run dev` | API + Vite dev server with hot reload |
-| `npm run snapshot` | Build `dist-cloudflare/` — the web bundle plus every API response as a static file |
-| `npm run cf:preview` | Snapshot, then serve it through the Workers runtime locally |
-| `npm run cf:deploy` | Snapshot, then `wrangler deploy` |
 | `npm test` | Transform, scoring, watchlist, pipeline, logging and API tests |
 
 Useful flags: `--only <id,id>`, `--since YYYY-MM-DD`, `--dry-run`, `--no-cache`,
@@ -139,17 +141,11 @@ variable, so an upstream error quoting the key back at us is caught too.
 
 ### Daily scheduling
 
-```bash
-./scripts/install-timer.sh
-```
-
-Installs a systemd **user** timer running `npm run daily` at 07:20 with catch-up
-for missed runs. Chosen over crontab because output lands in the journal,
-`systemctl --user status` shows whether the last run actually succeeded, and
-`Persistent=true` fills a run missed while the machine was off — a skipped day
-leaves a permanent hole in the score history.
-
-For timers to fire while you are logged out: `sudo loginctl enable-linger $USER`.
+In production the pipeline is a scheduled service running the same image as the
+API (`railway.cron.toml`: `daily` at 07:20 UTC) — see
+[docs/deploy-railway.md](docs/deploy-railway.md). Locally, run `npm run daily`
+when you want fresh numbers, or schedule it with cron / a systemd timer; it is an
+ordinary command that exits non-zero only when that run failed.
 
 ---
 
@@ -319,11 +315,15 @@ config/indicators.yaml     THE model — weights, thresholds, transforms
 packages/
   core/         types, Store interface, scoring engine, derived series, stats,
                 quote statistics (quotes.ts) and the markets board (board.ts)
+  store/        SqliteStore, PostgresStore, versioned migrations, createStore()
   connectors/   one module per source, uniform interface
   ingest/       CLI: migrate, doctor, ingest, backfill, derive, score, daily
-  api/          Hono API — runs on Node now, Workers later unchanged
+  api/          Hono API + server.js (also serves the built dashboard)
   web/          React + Vite dashboard, hand-rolled SVG charts
-data/world.db   SQLite (gitignored)
+data/world.db   local SQLite (gitignored); production uses Postgres
+Dockerfile      one image: API (default) or `cli.js daily`
+railway.*.toml  Railway config-as-code for the two services
+docker-compose.yml  the production shape locally (Postgres + MinIO + API)
 ```
 
 **Everything is a time series.** Every connector, whatever its wire format (SDMX,
@@ -331,7 +331,13 @@ ArcGIS, XML, CSV, JSON), normalises to `(series_id, date, value)`. Storage, scor
 charting and staleness are then written once rather than once per source.
 
 **Adding a source** means writing one module and appending it to the registry in
-`packages/connectors/src/index.ts`. Nothing else changes.
+`packages/connectors/src/index.ts`. Nothing else changes — including in
+production, where there is no one to run `npm run backfill`. `daily` does it: after
+its 120-day ingest it looks for connector series with no row in `series_backfill`
+(a new source, or a new entry in an existing catalogue), fetches 25 years for them,
+and records them as done. Sources that fetch per series (FRED, EIA) fetch only the
+new ones. A failed attempt records nothing and is retried the next day. The same
+mechanism is why an empty production database fills itself on its first run.
 
 **Connector failures are isolated.** One broken feed must never abort the other
 thirty. Every outcome — including failure — is written to `source_runs`, which is
@@ -344,140 +350,82 @@ range, the five-year percentile and the sparkline are all computed in
 decades of observations for a hundred rows and recomputing on every render — is both
 slower and impossible to unit-test.
 
-**`raw_cache` is not a performance optimisation.** It stores verbatim upstream
-responses so a parsing bug found on Tuesday can be fixed and re-run against Monday's
-exact bytes without burning a rate-limited quota.
+**Storage is chosen by environment, and changed only by code.** `DATABASE_URL`
+set to a `postgres://` URL selects `PostgresStore`; without it the local SQLite
+file (`WD_DB_PATH`, default `data/world.db`) is used, so a laptop needs no setup.
+Both implement the same `Store` interface and run the same contract tests.
+
+Schema changes are **versioned migrations** in `packages/store/src/migrations.ts`
+— an append-only list, recorded per database in `schema_migrations`, each applied
+once in its own transaction. Every CLI command and the API boot run pending
+migrations (Postgres serialises concurrent runners on an advisory lock), so a
+migration reaches production by being merged, never by someone editing a database.
+Write new columns with the `ID` / `FLOAT` / `TEXT` tokens: they are the three
+places SQLite and Postgres genuinely differ (identity columns, 8-byte floats, and
+byte-order text collation, without which Postgres on a glibc host sorts `us_a`
+before `us.a_b`).
+
+**The raw response cache is not a performance optimisation.** It stores verbatim
+upstream responses so a parsing bug found on Tuesday can be fixed and re-run against
+Monday's exact bytes without burning a rate-limited quota. It is kept **outside the
+database** — the bodies were ~60% of the old SQLite file, are rarely read, and refill
+themselves — in whatever `WD_CACHE_URL` names:
+
+| `WD_CACHE_URL` | Where |
+|---|---|
+| unset | `data/cache/` — gzipped JSON files, the local default |
+| `s3://bucket/prefix` | Any S3-compatible store (AWS S3, Cloudflare R2, Railway Buckets, MinIO), with `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, optional `S3_REGION` (R2 wants `auto`) and `S3_URL_STYLE=virtual` |
+| `file:/dir` | A directory of your choosing |
+| `none` | Nothing is kept |
+
+`npm run daily` prunes entries older than `WD_CACHE_RETENTION_DAYS` (default 30),
+in the app rather than as a bucket lifecycle rule so it behaves the same on every
+host. A cache that is unreachable costs a refetch and a warning, never a failed
+connector. `doctor` writes nothing to it.
+
+Migration 3 drops the old `raw_cache` table. SQLite does not hand the space back on
+its own; run `sqlite3 data/world.db 'VACUUM'` once afterwards to shrink the file.
 
 ### Deployment
 
-**Cloudflare serves the read path.** The pipeline stays where it is — the Node
-CLI on the local systemd timer — and Cloudflare hosts the dashboard and a
-precomputed copy of every API response. This is fallback #2 from
-[docs/deploy-cloudflare.md](docs/deploy-cloudflare.md) §7, taken in preference
-to running the pipeline on Workers: it costs $0, needs no `CloudflareStore`, no
-D1, no connector partitioning, and none of the three free-plan blockers in §1
-apply to a Worker that only reads static files.
+**Merging to `main` is the deploy.** Production is one Docker image run as two
+Railway services — the API (which also serves the dashboard) and a daily cron
+job — over Postgres, with raw responses in an S3-compatible bucket. The full
+runbook is [docs/deploy-railway.md](docs/deploy-railway.md).
 
-#### Deploying
-
-```bash
-npm run cf:preview   # snapshot + the real Workers runtime, locally
-npm run cf:deploy    # snapshot + wrangler deploy
+```
+push to main ─▶ CI (build, test on Postgres + MinIO, image smoke test)
+             ─▶ worldhealth-api   pre-deploy migrate, then server.js, health /healthz
+             ─▶ worldhealth-cron  daily at 07:20 UTC, then exit
 ```
 
-`cf:deploy` is the whole procedure: it rebuilds the TypeScript, rebuilds the web
-bundle, regenerates the snapshot from the current `data/world.db`, and uploads.
-Run it **after** `npm run daily`, never before — it publishes whatever is in the
-database at that moment.
+Everything that changes production is code:
 
-Authenticate first, once per machine:
+| Change | Reaches production by |
+|---|---|
+| Code, `config/indicators.yaml` weights | Merge — both services rebuild |
+| Schema | A migration in `packages/store/src/migrations.ts`, applied before the new API takes traffic |
+| A new source or catalogue entry | Merge — the next `daily` backfills its history itself |
+| API keys | Service variables, the one thing not in the repo |
+
+The initial load is a one-off `npm run copy-store -- --from data/world.db` into the
+production Postgres; after that no one touches the database. An empty database
+also works — the first `daily` backfills everything.
+
+**Moving host is a configuration change.** The application reads only
+environment variables (`DATABASE_URL`, `WD_CACHE_URL`, `S3_*`, `PORT`, API keys),
+and the image has two entry points: `server.js` and `cli.js daily`. Railway's
+specifics are confined to `railway.api.toml` and `railway.cron.toml`; the
+runbook's §2 maps the same three lines onto Fly, Render, a VPS and Kubernetes.
+
+#### Running the production shape locally
 
 ```bash
-npx wrangler login              # interactive, OAuth
-# or, for anything unattended:
-export CLOUDFLARE_API_TOKEN=... # scope: Workers Scripts:Edit
+docker compose up --build            # Postgres + MinIO + the API on :8787
+docker compose run --rm cron         # one daily run against them
 ```
 
-Prefer the token for automation. The OAuth session expires and cannot refresh in
-a non-interactive shell, which is a silent 07:20 failure waiting to happen if a
-timer ever runs the deploy.
-
-Verify a deploy landed by reading the manifest the snapshot writes:
-
-```bash
-curl -s https://<your-worker>.workers.dev/api/snapshot
-# {"builtAt":"…","asOf":"2026-09-20","routes":334,"series":318,…}
-```
-
-#### There is no deploy on push
-
-Committing changes nothing, and Cloudflare's Git integration cannot be made to
-work here: Workers Builds clones the repo and runs the build, but
-`npm run snapshot` needs `data/world.db` — 300 MB and gitignored — so the build
-would stop at `No database at …`.
-
-That is the shallow reason. The real one is that a commit is the wrong trigger.
-What changes on this site is data, not code: a README edit would republish
-byte-identical payloads, while a `daily` run that ingests new observations
-produces an entirely new dashboard and touches no commit at all. The Worker is
-2 KiB and essentially never changes; the 74.6 MB of snapshot JSON beside it
-changes every morning.
-
-So the trigger belongs on the pipeline, not the repo — an `ExecStartPost=` on
-the `world-dashboard.service` unit in [scripts/install-timer.sh](scripts/install-timer.sh),
-which systemd runs only if `ExecStart` succeeded. Since `daily` exits non-zero
-only when that run actually failed, a broken ingest then leaves yesterday's good
-snapshot published rather than overwriting it with a worse one — the same
-"missing beats wrong" rule the scorer follows. Not wired up yet.
-
-#### How it is built
-
-`npm run snapshot` builds `dist-cloudflare/`: the Vite bundle plus one JSON file
-per API route, including every pillar and all 318 series. It generates those
-files by calling the real routes through Hono's `app.request()` rather than
-reassembling the payloads, so the published bytes are the bytes `npm run api`
-would serve — verified byte-identical, and the reason there is no second
-implementation of the dashboard payload to keep in step.
-
-`packages/api/src/worker.ts` is the entire server: it maps `/api/dashboard` onto
-`api/dashboard.json`, attaches cache headers, and lets everything else fall
-through to the asset store without invoking the Worker at all. It imports
-nothing, so there is no `nodejs_compat` and nothing that can drift from the Node
-build.
-
-Two things in `wrangler.jsonc` that look like defaults but are not:
-
-- **`not_found_handling` is deliberately unset.** Under
-  `"single-page-application"` a missing asset returns *200 with `index.html`*,
-  which would sail past a status check and feed the dashboard HTML to
-  `res.json()`. The web build uses hash routing and never needed it.
-- **`compatibility_date` tracks the installed wrangler, not today.** wrangler
-  4.110.0 bundles a runtime that refuses any date after 2026-07-15, so setting
-  it to the current date still deploys but breaks `npm run cf:preview` with
-  `This Worker requires compatibility date …`. Move it when wrangler is
-  upgraded.
-
-**What this costs you.** Two things that work locally do not work there:
-
-- **Scores are not computed live.** The API invariant that editing
-  `config/indicators.yaml` shows up on refresh holds for `npm run api` only. On
-  Cloudflare a weight edit changes nothing until `npm run cf:deploy` re-runs the
-  snapshot.
-- **`?as_of=` is inert.** A query string does not select a file, so it is
-  ignored rather than honoured. Backtests stay local, which is where
-  `docs/deploy-cloudflare.md` §5 argues they belong anyway.
-
-A stale deploy is diagnosable from the browser: `/api/snapshot` carries the
-build timestamp and the `asOf` date the payloads were computed for.
-
-### Other options
-
-The build is local-first but structured so hosting is a swap, not a rewrite:
-
-- All database access goes through the `Store` interface in `packages/core`. The
-  SQLite implementation is one file; D1 or Postgres is a second file.
-- SQL is deliberately portable — `INSERT … ON CONFLICT DO UPDATE` only, valid in
-  SQLite, Postgres and D1. No SQLite extensions, with one caveat: `source_runs`
-  and `pipeline_runs` use SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT`, which D1
-  accepts (D1 *is* SQLite) but Postgres does not — a Postgres `Store` needs
-  `GENERATED ALWAYS AS IDENTITY` there instead.
-- The API is Hono, which runs unmodified on Node and on Cloudflare Workers.
-- Every `Store` method is async even though SQLite is synchronous, so call sites
-  already await.
-
-Two full migration plans, with the arithmetic behind every decision:
-
-- **[docs/deploy-cloudflare.md](docs/deploy-cloudflare.md)** — $0/month on the
-  Workers free plan. Requires re-engineering the pipeline into small sharded
-  Cron Trigger invocations (D1's daily row caps and the 10 ms CPU ceiling rule
-  out the naive "Workers + D1" shape) and moving observation history to R2.
-  Live per-request scoring is also lost — the API serves a precomputed snapshot
-  instead.
-- **[docs/deploy-railway.md](docs/deploy-railway.md)** — ~$5–12/month. A
-  Postgres service plus separate API and cron services (no free tier; a volume
-  only attaches to one service, so SQLite can't be shared across the split).
-  No re-architecture: live scoring and `--as-of` backtesting keep working
-  exactly as they do locally.
+API keys are picked up from `.env.local` if it exists.
 
 ---
 
@@ -509,8 +457,8 @@ alert for the series underneath it.
 
 `npm run daily` exits non-zero only when *that run* failed — a stage that threw, a
 required source that errored, a derivation that stopped computing. Data that is
-merely stale is critical on the page but leaves the systemd unit green, because a
-unit that is red every night over an upstream nobody controls is a unit nobody
+merely stale is critical on the page but leaves the cron run green, because a
+job that is red every night over an upstream nobody controls is a job nobody
 checks. `npm run alerts` is the stricter check: it exits 1 on any critical alert.
 
 ---
@@ -557,8 +505,8 @@ catalogue). Retired series are not fetched, are never counted as stale, and are
 excluded from the per-source "N of M past their budget" denominator, so *all* series
 of a source being stale keeps meaning the feed is dead. Their history stays in the
 database and still scores in an `--as-of` backtest inside the window they covered.
-The column arrives on an existing database through `ADDED_COLUMNS` in
-`core/src/schema.ts`, applied by `npm run migrate`.
+The column arrives on an existing database through migration 2
+(`series_retired_at`) in `packages/store/src/migrations.ts`.
 
 Retiring is not the same as replacing. `NPTLTL`'s closest live substitute is
 `DRALACBN` (delinquency rate on all loans, all commercial banks); adding it is a new
@@ -570,10 +518,19 @@ bundled with the retirement.
 ## Testing
 
 ```bash
-npm test        # 120 tests: transforms, point-in-time discipline, aggregation,
+npm test        # transforms, point-in-time discipline, aggregation,
                 #            watchlist, quote statistics, board integrity,
-                #            alerting, logging, HTTP retry/redaction, both Store
-                #            implementations, connector isolation, API routes
+                #            alerting, logging, HTTP retry/redaction, every Store
+                #            implementation, migrations, connector isolation, API routes
+
+# the same suite, with the Store and cache contract tests also run against
+# Postgres and an S3-compatible store
+docker run -d --rm --name wd-pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:16
+docker run -d --rm --name wd-s3 -p 59000:9000 -e MINIO_ROOT_USER=wdtest \
+  -e MINIO_ROOT_PASSWORD=wdtest-secret quay.io/minio/minio server /data
+WD_TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres \
+WD_TEST_S3_ENDPOINT=http://localhost:59000 WD_TEST_S3_ACCESS_KEY_ID=wdtest \
+WD_TEST_S3_SECRET_ACCESS_KEY=wdtest-secret npm test
 npm run doctor  # probe every upstream source, write nothing
 npm run alerts  # what is broken right now, exit 1 if anything is critical
 ```
@@ -588,8 +545,11 @@ The failure-path tests are there for the same reason: that one broken connector 
 not stop the other thirty, that a stage which throws still leaves a row saying so and
 still exits non-zero, that a route which throws returns a labelled 500 instead of an
 empty body, and that a credential never survives a log line or an error message.
-`MemoryStore` is tested against `SqliteStore` with the same assertions, because the
-fast in-memory store is only evidence about production while the two agree.
+`MemoryStore`, `SqliteStore` and `PostgresStore` run the same assertions, because
+the fast in-memory store is only evidence about production while all three agree.
+Each Postgres case gets its own schema, so one server serves the whole suite. Use
+the Debian `postgres:16` image rather than Alpine: musl happens to sort text
+bytewise, which hides exactly the collation bug the tests exist to catch.
 
 Set `WD_LOG_LEVEL=debug` to see the pipeline's own logs while a test runs; the suite
 silences them by default.

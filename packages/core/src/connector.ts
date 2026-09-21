@@ -4,6 +4,13 @@ import type { Cadence, IsoDate, Observation, SeriesDef, WorldEvent } from './typ
 export interface FetchCtx {
   /** Earliest date to fetch. Backfill passes a distant past; daily ingest passes ~90 days ago. */
   since: IsoDate;
+  /**
+   * Restrict the run to these series ids, when set. A hint, not a contract: a
+   * source that fetches per series (FRED, EIA) honours it so backfilling one
+   * new catalogue entry is one request rather than ninety; a source whose API
+   * returns everything at once ignores it, and the extra rows are harmless.
+   */
+  seriesIds?: ReadonlySet<string>;
   today: IsoDate;
   http: Http;
   env: NodeJS.ProcessEnv;

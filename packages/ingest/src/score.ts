@@ -1,9 +1,7 @@
 import {
-  computeComposite, evaluateWatchlist, loadScoringConfig, log, MIN_PILLAR_COVERAGE, todayIso,
+  computeComposite, defaultConfigPath, evaluateWatchlist, loadScoringConfig, log, MIN_PILLAR_COVERAGE, todayIso,
   type CompositeScore, type Observation, type ScoreRecord, type Store, type WatchlistResult,
 } from '@wd/core';
-import { resolve } from 'node:path';
-import { ROOT } from './config.js';
 
 const logger = log.child('score');
 
@@ -13,7 +11,7 @@ export interface ScoreOutcome {
 }
 
 export function configPath(): string {
-  return process.env.WD_CONFIG_PATH ?? resolve(ROOT, 'config/indicators.yaml');
+  return defaultConfigPath();
 }
 
 /**

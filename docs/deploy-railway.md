@@ -1,241 +1,159 @@
 # Deploying to Railway
 
-**Target: Postgres + a separate cron service, ~$5–12/month on Hobby.**
+**Production: one Docker image, two services, Postgres, and an S3 bucket.
+Merging to `main` is the deploy.** Roughly $5–12/month on the Hobby plan.
 
-This is a plan, not a changelog. Nothing here has been executed yet.
-
-Railway has no free tier — Hobby is $5/month including $5 of usage. This
-document exists to give the cost and the design decisions up front, not to
-chase a free deployment the way the Cloudflare plan does.
-
----
-
-## 1. Cost
-
-An always-on API service, a Postgres instance, and a daily cron job land
-around **$5–12/month** depending on Postgres storage and API traffic, on top of
-the $5 Hobby subscription.
-
-`deploy.sleepApplication` can put the API service to sleep between requests for
-a personal dashboard with light traffic, trading a cold start (first request
-after idle pays a few seconds) for lower usage cost. Worth enabling if the
-dashboard is checked a few times a day rather than kept open.
-
----
-
-## 2. Why Postgres, not SQLite on a volume
-
-The obvious-looking shortcut — keep SQLite, mount a Railway volume, point
-`WD_DB_PATH` at it — does not survive contact with the two-service split this
-plan calls for.
-
-**A Railway volume attaches to exactly one service.** A cron service and an API
-service cannot share one SQLite file: at best you serialize the two into one
-service (defeating the separation, and reintroducing "the API blocks on a
-5-minute ingest run" as a real failure mode); at worst you point two services at
-the same volume and get concurrent-writer corruption. Neither is acceptable for
-a workload where the API needs to stay responsive while ingest runs.
-
-Postgres, provisioned as its own Railway service, is what makes the split
-possible — both the API and the cron service connect to it independently, no
-shared filesystem required. This is also exactly the swap `core/src/store.ts`
-was built for: the `Store` interface exists so a new backing store is a new
-file, not a refactor of every call site.
-
----
-
-## 3. Three services
-
-Declared as infrastructure-as-code in `.railway/railway.ts`, reviewed, then
-applied with `railway config apply`:
-
-```ts
-import { service, postgres } from "railway";
-
-export const db = postgres("worldhealth-db");
-
-export const api = service("worldhealth-api", {
-  build: { buildCommand: "npm run build && npm -w @wd/web run build" },
-  deploy: {
-    startCommand: "node packages/api/dist/server.js",
-    healthcheckPath: "/api/health",
-  },
-  variables: {
-    DATABASE_URL: db.connectionString,
-    WD_LOG_LEVEL: "info",
-    WD_LOG_FORMAT: "json",
-    FRED_API_KEY: "", // placeholder — set via `railway variables set`, never here
-    EIA_API_KEY: "",
-  },
-});
-
-export const cron = service("worldhealth-cron", {
-  build: { buildCommand: "npm run build" },
-  deploy: {
-    startCommand: "node packages/ingest/dist/cli.js daily",
-    cronSchedule: "20 7 * * *", // matches scripts/install-timer.sh's local 07:20
-    restartPolicyType: "NEVER", // a cron job must exit, not restart on completion
-  },
-  variables: {
-    DATABASE_URL: db.connectionString,
-    WD_LOG_LEVEL: "info",
-    WD_LOG_FORMAT: "json",
-    FRED_API_KEY: "",
-    EIA_API_KEY: "",
-  },
-});
+```
+               ┌──────────────────────────── one image (Dockerfile) ───────────────────────────┐
+push to main → │ worldhealth-api   railway.api.toml   pre-deploy: migrate → server.js  /healthz │
+               │ worldhealth-cron  railway.cron.toml  20 7 * * * UTC: daily, then exit          │
+               └────────────────────────────────────────────────────────────────────────────────┘
+                          │ DATABASE_URL                         │ WD_CACHE_URL + S3_*
+                   worldhealth-db (Postgres)             worldhealth-cache (bucket: raw responses)
 ```
 
-Both app services reference the same `db.connectionString` — one Postgres
-instance, two independent connections. `api` also builds and serves the web
-bundle, matching `server.ts`'s existing "serve `packages/web/dist` if it
-exists" behavior.
+After the one-time setup below, nothing in production is edited by hand:
 
-**Per the account's Railway gotchas** (see §7): define every variable — including
-`FRED_API_KEY` and `EIA_API_KEY` as empty placeholders — at service-creation
-time via the CLI, not later through the dashboard. Nobody should have to
-discover a missing key by hitting a broken connector.
+| Change | How it reaches production |
+|---|---|
+| Code, weights in `config/indicators.yaml` | Merge → both services rebuild from the new commit |
+| Schema | A new entry in `packages/store/src/migrations.ts` → applied by the API's pre-deploy `migrate` before the release takes traffic (and by every CLI run, under an advisory lock) |
+| A new data source or catalogue entry | Merge → the next `daily` ingests it and backfills its 25-year history on its own (`series_backfill`) |
+| API keys | Railway service variables — the only thing that is not in git |
 
 ---
 
-## 4. New code: `PostgresStore`
+## 1. Why this shape
 
-`packages/core/src/postgres-store.ts`, ~400 lines implementing the existing
-`Store` interface over `pg`. `CLAUDE.md` states the SQL is portable to Postgres
-already — this is *almost* true, and the plan needs to record exactly where it
-is not, so the implementation doesn't discover it mid-migration.
+- **Postgres, not SQLite on a volume.** A Railway volume attaches to exactly one
+  service. The API and the cron job are two services, so they need a database
+  both can reach over the network.
+- **The raw response cache in a bucket, not the database.** Upstream bodies
+  were ~60% of the old SQLite file, are rarely read, and refill themselves.
+- **Two services from one image**, told apart only by start command. The cron
+  service runs, exits, and waits for the next firing; a non-zero exit is a failed
+  run in Railway's view, the same verdict `pipeline_runs` records.
+- **The API still scores live** from `config/indicators.yaml` on each request, and
+  `?as_of=` backtests work in production, unlike the retired Cloudflare snapshot.
 
-### The portability gap
+## 2. Portability
 
-`packages/core/src/schema.ts` declares two tables with:
+Nothing in the application knows it is on Railway. Everything platform-specific
+is in `Dockerfile` (generic) and `railway.*.toml` (Railway's). Another host needs:
 
-```sql
-id INTEGER PRIMARY KEY AUTOINCREMENT
+1. The same image, run twice: `node packages/api/dist/server.js` (serve, health
+   check `GET /healthz`) and `node packages/ingest/dist/cli.js daily` (once a day).
+2. `node packages/ingest/dist/cli.js migrate` before each API release (optional:
+   every command migrates on start anyway).
+3. The variables in §4.
+
+Fly (`fly.toml` + a scheduled machine), Render (web service + cron job), a VPS
+(`docker compose` + a systemd timer or crontab), or Kubernetes (Deployment +
+CronJob) all map onto those three lines. `docker-compose.yml` is a working
+local example of the whole topology, including an S3-compatible store (MinIO).
+
+## 3. One-time setup
+
+Provisioning is done through the Railway CLI or dashboard, once, in a **fresh**
+environment (never `railway environment new --duplicate`; see §7).
+
+1. Create the project and a **Postgres** service (`worldhealth-db`).
+2. Create a **Bucket** (`worldhealth-cache`), or use any S3-compatible bucket
+   (R2, S3). Note its endpoint and credentials.
+3. Create **`worldhealth-api`** from the GitHub repo, branch `main`.
+   Settings → Config-as-code → `railway.api.toml`. Generate a domain.
+4. Create **`worldhealth-cron`** from the same repo and branch.
+   Settings → Config-as-code → `railway.cron.toml`. No domain.
+5. Set the variables in §4 on both app services.
+6. Enable "Wait for CI" on both, so a red GitHub Actions run blocks the deploy.
+7. Load history (§5), or let the first `daily` backfill from nothing.
+
+## 4. Variables
+
+Set on **both** `worldhealth-api` and `worldhealth-cron`. Reference variables
+(`${{…}}`) keep them in step with the services they point at.
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | `${{worldhealth-db.DATABASE_URL}}` |
+| `WD_CACHE_URL` | `s3://<bucket>/raw` |
+| `S3_ENDPOINT` | the bucket's endpoint, e.g. `${{worldhealth-cache.ENDPOINT}}` |
+| `S3_ACCESS_KEY_ID` | `${{worldhealth-cache.ACCESS_KEY_ID}}` |
+| `S3_SECRET_ACCESS_KEY` | `${{worldhealth-cache.SECRET_ACCESS_KEY}}` |
+| `S3_REGION` | the bucket's region (`auto` for R2); defaults to `us-east-1` |
+| `S3_URL_STYLE` | `virtual` only if the store rejects path-style URLs |
+| `FRED_API_KEY` | required for most of the model |
+| `EIA_API_KEY` | energy panel |
+| `COINGECKO_API_KEY` | optional |
+| `WD_CACHE_RETENTION_DAYS` | optional, default 30 |
+
+The exact bucket variable names depend on the bucket product; check them on the
+bucket service and map them onto the `S3_*` names above. The application reads
+only the `S3_*` names (or `AWS_*` equivalents), so a change of provider is a
+change of variables, not code. `DATABASE_URL` and every `*_KEY`/`*SECRET*` value
+is scrubbed from logs.
+
+## 5. Loading the existing history
+
+`copy-store` copies a local SQLite database into Postgres: every table except the
+old raw cache, including `series_backfill`, so production does not re-backfill
+what it already has. Rows already in the target are left alone, so a re-run
+after production has started writing never overwrites newer data.
+
+```bash
+# the database's public URL: worldhealth-db → Connect → Public network
+DATABASE_URL='postgres://…' npm run copy-store -- --from data/world.db
 ```
 
-**This is SQLite-only.** D1 accepts it because D1 *is* SQLite under the hood;
-Postgres does not have `AUTOINCREMENT`. `source_runs` and `pipeline_runs` are
-the two tables affected. The fix is a dialect parameter in `schema.ts`:
+1.08M observations copy in about 25 seconds from a local machine to a local
+Postgres; over the internet expect a few minutes.
 
-```sql
--- SQLite / D1
-id INTEGER PRIMARY KEY AUTOINCREMENT
+Skipping this step is also valid: an empty database fills itself on the first
+`daily` (every series is un-backfilled, so each gets its 25 years). That takes
+longer and spends upstream quota; the copy is faster for the initial load.
 
--- Postgres
-id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY
-```
+## 6. Operating it
 
-Also needed for Postgres: `REAL` → `DOUBLE PRECISION` (SQLite's `REAL` is fine
-as an alias in Postgres, but `DOUBLE PRECISION` is the idiomatic form and avoids
-relying on the alias). Everything else — `TEXT` for dates, `INSERT … ON CONFLICT
-DO UPDATE`, the index definitions — is valid Postgres unchanged, which is what
-lets `PostgresStore` be additive rather than a rewrite of `schema.ts`.
-
-### Placeholder rewriting
-
-SQLite (`better-sqlite3`) uses `?` positional placeholders; `pg` uses `$1`,
-`$2`, .... This is purely a `PostgresStore` implementation concern — a small
-rewrite helper or `$N`-native queries written directly in the new file. No other
-package needs to know a placeholder style exists.
-
----
-
-## 5. Data migration
-
-A one-off script, `packages/ingest/src/migrate-store.ts`, opens both stores
-(`SqliteStore` reading, `PostgresStore` writing) and streams every table across
-in the order `schema.ts` declares them (foreign-key-free, so order only matters
-for readability, not correctness).
-
-**Skip `raw_cache`.** It is 185 MB of the local DB's 301 MB, and it refills
-itself by design — the whole point of `raw_cache` is that it is replayability,
-not data that must survive a migration (`CLAUDE.md`). Migrating it buys nothing
-and roughly triples the transfer.
-
-That leaves ~116 MB — 1,074,312 observations plus `series`, `source_runs`,
-`pipeline_runs`, `series_health`, `scores`, `events`. Railway/Postgres has no
-row-count caps analogous to D1's, so this is **one run taking a few minutes**,
-not a multi-day drip.
-
----
-
-## 6. Scheduling semantics
-
-A Railway cron service runs the same container image on a schedule and must
-**exit** when the work is done — hence `restartPolicyType: NEVER` above. Railway
-watches the exit code; a non-zero exit is a failed run in Railway's own view,
-same as it already is for the systemd timer.
-
-This matches what the codebase already does. `runStage()` in
-`packages/ingest/src/stage.ts` writes a `pipeline_runs` row on success, on
-partial failure and on exception, then re-raises — so the exit code the
-scheduler sees still tells the true story, and `npm run alerts` /
-`collectAlerts` keep working completely unchanged. Nothing about the alerting
-design needs to know it's running on Railway instead of a systemd unit.
-
----
+- **Is it up?** `GET /healthz` (process and database), `GET /api/health`
+  (the data: alert summary and last pipeline run). The dashboard's alert list
+  and `npm run alerts` read the same computation.
+- **Run the pipeline now:** Railway → `worldhealth-cron` → Deployments → Run now,
+  or `railway run --service worldhealth-cron node packages/ingest/dist/cli.js daily`.
+- **Logs** are JSON lines (`WD_LOG_FORMAT=json` in the image).
+- **Rollback** is Railway's redeploy of the previous deployment. Migrations are
+  forward-only, so a rollback past a migration runs old code against a newer
+  schema: write migrations additively (new columns nullable, no drops of
+  anything the previous release reads) and drop in a later release.
+- **Backtests** (`--as-of`) work against production (`?as_of=` on the API) and
+  locally against a `copy-store`d or SQLite database.
 
 ## 7. Railway gotchas specific to this account
 
-Incident-derived, from `~/.claude/skills/railway-local-gotchas` — each of these
-has actually bitten this account and is not general Railway documentation:
+Incident-derived, from `~/.claude/skills/railway-local-gotchas`:
 
 - **Never `railway environment new <name> --duplicate <source>`.** It reuses the
-  same underlying service IDs across environments — they are not isolated. If a
-  staging environment is wanted later, create it fresh and add new services to
-  it explicitly; do not duplicate.
+  same underlying service IDs across environments. Create a staging environment
+  fresh and add services to it explicitly.
 - **The GitHub deploy-trigger branch binds to the service, not the
-  environment.** If a service is ever shared across environments (e.g. by using
-  `--duplicate` despite the warning above), changing the tracked branch for one
-  environment silently changes it for every environment sharing that service.
-  Verify with `railway status --json` per environment after connecting, don't
-  assume a flag scoped correctly.
-- **`railway domain` is not read-only.** Running it against a service with no
-  domain yet generates and assigns one as a side effect. Don't run it during a
-  "just checking" pass.
-- **Custom-domain cert issuance is staged, not instant.** After `railway
-  domain` and publishing the DNS records (CNAME + a separate
-  `_railway-verify[.sub]` TXT — see `cloudflare-dns-ops`), the CNAME typically
-  propagates within minutes but `certificate.status` moving off
-  `VALIDATING_OWNERSHIP` can take minutes to a couple of hours. Check `railway
-  domain status <domain> --json` rather than assuming a fresh publish means
-  live; don't `curl -sI` a not-yet-issued cert and read anything into the result.
-- **Rotating a credential (`DATABASE_URL`, an API key) on an environment already
-  in use is a meaningful, hard-to-notice change** — don't do it on a vague
-  "clean things up" instruction. Confirm the specific action, or confirm the
-  environment is not yet live.
-- **Destructive or credential-rotating commands require explicit user
-  confirmation** — this account has the plugin's auto-approve hook disabled
-  because it silently approved `service`/`environment delete` and `variables
-  set`. That confirmation requirement is deliberate; don't route around it.
+  environment.** Verify with `railway status --json` per environment.
+- **`railway domain` is not read-only.** Run against a service with no domain it
+  generates one.
+- **Custom-domain certificates are staged.** After publishing the CNAME and the
+  `_railway-verify` TXT (via the `cloudflare-dns-ops` skill), check `railway domain
+  status <domain> --json` rather than assuming it is live.
+- **Rotating `DATABASE_URL` or a key on a live environment** is a real change;
+  confirm the specific action first.
+- **Destructive or credential-changing commands need explicit confirmation.**
 
----
+## 8. Cutover from the Cloudflare snapshot
 
-## 8. Cutover and rollback
+The previous production was a static snapshot on a Cloudflare Worker, published
+from a laptop. To move:
 
-1. Provision `worldhealth-db`, `worldhealth-api`, `worldhealth-cron` in a
-   **staging** environment first — created fresh, not duplicated, per §7.
-2. Run `migrate-store.ts` into staging's Postgres.
-3. Run the cron service manually once (`railway run` or a manual trigger) and
-   diff `/api/dashboard` against the local API's response — composite, every
-   pillar score, every watchlist verdict must match.
-4. Run both the Railway cron and the local systemd timer in parallel for a few
-   days, diffing daily.
-5. Promote: repeat the service setup in `production` (its own fresh services,
-   not shared with staging), point DNS at it.
-
-**Rollback is DNS plus re-enabling `scripts/install-timer.sh`.** The local
-SQLite path and `--as-of` backtesting stay a local concern regardless of where
-production runs.
-
----
-
-## 9. What doesn't change
-
-Unlike the Cloudflare plan, **nothing here breaks the "scores live from
-`config/indicators.yaml` on each request" invariant.** Postgres has no read/write
-row caps, `api` is a long-running Node process with no 10 ms CPU ceiling, and
-`routes.ts`'s `loadSeries` — 127,192 rows per `/api/dashboard` call — runs
-exactly as it does today. `--as-of` point-in-time scoring on demand also keeps
-working unmodified. Railway costs more; in exchange, it costs nothing in
-re-architecture.
+1. Complete §3–§5 in a fresh `staging` environment. Trigger the cron once and
+   compare `/api/dashboard` against a local `npm run api` on the same data: the
+   composite, every pillar and every watchlist verdict must match.
+2. Repeat in `production` with its own fresh services.
+3. Point the domain at `worldhealth-api` (CNAME + `_railway-verify` TXT).
+4. Delete the old Worker (`wrangler delete`) once the domain has moved; nothing
+   in the repo deploys it any more.

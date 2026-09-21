@@ -74,7 +74,7 @@ export const eiaConnector: Connector = {
     const warnings: string[] = [];
     const ok: EiaSeries[] = [];
 
-    const queue = [...CATALOG];
+    const queue = CATALOG.filter((s) => !ctx.seriesIds || ctx.seriesIds.has(s.id));
     const worker = async (): Promise<void> => {
       for (;;) {
         const s = queue.shift();
@@ -118,7 +118,7 @@ export const eiaConnector: Connector = {
     }));
 
     // Lower-48 electricity demand: a daily, unrevised pulse of real activity.
-    try {
+    if (!ctx.seriesIds || ctx.seriesIds.has('us.electricity_demand')) try {
       const elecUrl = 'https://api.eia.gov/v2/electricity/rto/daily-region-data/data/'
         + `?api_key=${encodeURIComponent(key)}`
         + '&frequency=daily&data[0]=value'

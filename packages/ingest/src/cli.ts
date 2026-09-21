@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 import {
-  SqliteStore, addDays, addYears, collectAlerts, describeError, hasRunFailure, log,
+  addDays, collectAlerts, describeError, hasRunFailure, loadEnv, log,
   summarizeAlerts, todayIso,
   type Alert, type CompositeScore, type Store, type WatchlistResult,
 } from '@wd/core';
+import {
+  PostgresStore, SqliteStore, copyStore, createCache, describeStoreTarget, openStore, resolveStoreTarget,
+} from '@wd/store';
 import { CONNECTORS, connectorHealth, getConnector } from '@wd/connectors';
-import { dbPath, loadEnv } from './config.js';
 import { runAll, type RunOutcome } from './runner.js';
+import { backfillSince, pendingBackfills, recordBackfill, runPendingBackfills } from './backfill.js';
 import { deriveAll, type DeriveOutcome } from './derive.js';
 import { computeAndStoreScores } from './score.js';
 import { runStage, type StageResult } from './stage.js';
@@ -158,8 +161,18 @@ function printScores(composite: CompositeScore, watchlist: WatchlistResult[], as
   }
 }
 
+/**
+ * Keep this many days of raw responses. Long enough to replay last week's
+ * bytes after a parser fix; short enough that the bucket does not grow
+ * forever, since nothing else removes an entry whose URL changed.
+ */
+function cacheRetentionDays(): number {
+  const n = Number(process.env.WD_CACHE_RETENTION_DAYS ?? 30);
+  return Number.isFinite(n) && n > 0 ? n : 30;
+}
+
 async function withStore<T>(fn: (store: Store) => Promise<T>): Promise<T> {
-  const store = new SqliteStore(dbPath());
+  const store = openStore(resolveStoreTarget());
   try {
     await store.migrate();
     return await fn(store);
@@ -174,7 +187,43 @@ async function main(): Promise<void> {
 
   switch (cmd) {
     case 'migrate': {
-      await withStore(async () => { console.log(`${C.green}Schema applied${C.reset} at ${dbPath()}`); });
+      // The deploy step: Railway runs this before a new release takes traffic.
+      const target = resolveStoreTarget();
+      const store = openStore(target);
+      try {
+        const ran = await store.migrateReport();
+        console.log(ran.length
+          ? `${C.green}Applied migration(s) ${ran.join(', ')}${C.reset} to ${describeStoreTarget(target)}`
+          : `${C.green}Schema current${C.reset} at ${describeStoreTarget(target)}`);
+        log.info('migrate', { applied: ran, store: describeStoreTarget(target) });
+      } finally {
+        await store.close();
+      }
+      break;
+    }
+
+    case 'copy-store': {
+      // One-off initial load of a local SQLite history into the production
+      // Postgres. Safe to re-run: rows already in the target are kept.
+      const from = flags.get('from');
+      const to = resolveStoreTarget(flags.has('to') ? { DATABASE_URL: flags.get('to') } : process.env);
+      if (!from || from === 'true') throw new Error('copy-store needs --from <path to world.db>');
+      if (to.kind !== 'postgres') throw new Error('copy-store target must be Postgres: set DATABASE_URL or pass --to');
+      const source = new SqliteStore(from);
+      const target = new PostgresStore({ connectionString: to.connectionString });
+      try {
+        await source.migrate();
+        await target.migrate();
+        console.log(`${C.bold}Copying${C.reset} ${from} → ${describeStoreTarget(to)} ${C.dim}(raw_cache skipped)${C.reset}\n`);
+        const copied = await copyStore(source, target, (p) => {
+          if (process.stdout.isTTY) process.stdout.write(`\r  ${p.table.padEnd(16)} ${p.copied}/${p.total}`);
+        });
+        if (process.stdout.isTTY) process.stdout.write('\n');
+        for (const c of copied) console.log(`  ${C.green}ok${C.reset} ${c.table.padEnd(16)} ${c.rows} rows`);
+      } finally {
+        await source.close();
+        await target.close();
+      }
       break;
     }
 
@@ -215,7 +264,7 @@ async function main(): Promise<void> {
       const results = await withStore((store) => runStage(store, 'ingest', async () => {
         const out = await runAll(
           connectors, store,
-          { since, dryRun, noCache: flags.get('no-cache') === 'true' },
+          { since, dryRun, noCache: flags.get('no-cache') === 'true', cache: createCache() },
           4, printOutcome,
         );
         // A dry run must not leave a row claiming the data was updated.
@@ -228,16 +277,19 @@ async function main(): Promise<void> {
     case 'backfill': {
       const connectors = selectConnectors(flags);
       // Percentile transforms need decades to be meaningful; default to 25 years.
-      const since = flags.get('since') ?? addYears(todayIso(), -25);
+      const since = flags.get('since') ?? backfillSince();
       const dryRun = flags.get('dry-run') === 'true';
       console.log(`${C.bold}Backfilling ${connectors.length} sources${C.reset} since ${since}`);
       console.log(`${C.dim}This can take a few minutes and will hit upstream rate limits if repeated.${C.reset}\n`);
       const results = await withStore((store) => runStage(store, 'backfill', async () => {
         const out = await runAll(
           connectors, store,
-          { since, dryRun, noCache: flags.get('no-cache') === 'true' },
+          { since, dryRun, noCache: flags.get('no-cache') === 'true', cache: createCache() },
           2, printOutcome,
         );
+        // Recorded so `daily` does not backfill the same series again. A
+        // short `--since` is recorded too: it was asked for explicitly.
+        if (!dryRun) for (const o of out) await recordBackfill(store, o, since);
         // A dry run must not leave a row claiming the data was updated.
         return { result: out, ...(dryRun ? { status: 'skipped' as const } : ingestStageResult(out)) };
       }));
@@ -294,16 +346,33 @@ async function main(): Promise<void> {
       // The single command a scheduler runs: fetch, derive, then score.
       const since = flags.get('since') ?? addDays(todayIso(), -120);
       console.log(`${C.bold}Daily update${C.reset} ${C.dim}(ingest → derive → score)${C.reset}\n`);
+      const cache = createCache();
       await withStore(async (store) => {
         // The outer stage is the proof the scheduler fired at all. Each inner
         // stage records its own row, so a failure is attributable to the step
         // that failed rather than to "the daily job".
         await runStage(store, 'daily', async () => {
           const results = await runStage(store, 'ingest', async () => {
-            const out = await runAll(CONNECTORS, store, { since }, 4, printOutcome);
+            const out = await runAll(CONNECTORS, store, { since, cache }, 4, printOutcome);
             return { result: out, ...ingestStageResult(out) };
           });
           summarise(results);
+
+          // A source or catalogue entry added in code arrives here: ingest has
+          // just declared its series with 120 days of data, and nothing has
+          // recorded a backfill for them yet. Only recorded as a stage when
+          // there was something to do, so a quiet day adds no noise.
+          const { outcomes: backfilled, pendingSeries } = await (async () => {
+            const pending = await pendingBackfills(store, CONNECTORS);
+            if (pending.size === 0) return { outcomes: [] as RunOutcome[], pendingSeries: 0 };
+            console.log(`\n${C.bold}Backfilling new series${C.reset} ${C.dim}(${[...pending.values()].flat().length} series from ${[...pending.keys()].join(', ')})${C.reset}`);
+            return runStage(store, 'backfill', async () => {
+              const out = await runPendingBackfills(store, CONNECTORS, { cache, onResult: printOutcome });
+              return { result: out, ...ingestStageResult(out.outcomes) };
+            });
+          })();
+          if (pendingSeries === 0) console.log(`\n${C.dim}No new series to backfill${C.reset}`);
+          const backfillFailed = backfilled.filter((r) => r.status === 'error');
 
           console.log(`\n${C.bold}Derived series${C.reset}`);
           const derived = await runStage(store, 'derive', async () => {
@@ -331,13 +400,13 @@ async function main(): Promise<void> {
           });
           printScores(composite, watchlist, todayIso());
 
-          const ingestFailed = results.filter((r) => r.status === 'error');
+          const ingestFailed = [...results, ...backfillFailed].filter((r) => r.status === 'error');
           const deriveFailed = errd;
           return {
             result: undefined,
             okCount: results.filter((r) => r.status === 'ok').length + okd,
             failCount: ingestFailed.length + deriveFailed.length,
-            rowsWritten: results.reduce((a, r) => a + r.rows, 0) + derived.reduce((a, d) => a + d.rows, 0),
+            rowsWritten: [...results, ...backfilled].reduce((a, r) => a + r.rows, 0) + derived.reduce((a, d) => a + d.rows, 0),
             failed: [
               ...ingestFailed.map((r) => ({ id: r.sourceId, error: r.error ?? null })),
               ...deriveFailed.map((d) => ({ id: d.id, error: d.detail ?? null })),
@@ -346,6 +415,16 @@ async function main(): Promise<void> {
           };
         });
 
+        // Outside the stages on purpose: a cache that cannot be pruned is a
+        // storage bill, not a failed update, and must not turn the run red.
+        try {
+          const cutoff = new Date(Date.now() - cacheRetentionDays() * 86_400_000);
+          const pruned = await cache.prune(cutoff);
+          log.info('cache pruned', { cache: cache.describe(), removed: pruned, retentionDays: cacheRetentionDays() });
+        } catch (err) {
+          log.warn('cache prune failed', { err, cache: cache.describe() });
+        }
+
         // The run ends with the same list the dashboard shows, so whoever reads
         // the cron output and whoever opens the page see one story.
         const alerts = await collectAlerts(store, { connectors: connectorHealth() });
@@ -353,7 +432,7 @@ async function main(): Promise<void> {
 
         // Only a failure of *this run* is worth a non-zero exit. Long-standing
         // staleness is critical on the page but would otherwise leave the
-        // systemd unit red every night until somebody fixed an upstream they
+        // scheduled job red every night until somebody fixed an upstream they
         // do not control.
         process.exitCode = hasRunFailure(alerts) ? 1 : 0;
       });
@@ -395,14 +474,16 @@ async function main(): Promise<void> {
       console.log(`
 ${C.bold}world-dashboard ingest CLI${C.reset}
 
-  ${C.cyan}migrate${C.reset}                 Apply the database schema
+  ${C.cyan}migrate${C.reset}                 Apply pending schema migrations (the deploy step)
+  ${C.cyan}copy-store${C.reset} --from <db>     One-off: copy a local SQLite DB into DATABASE_URL (Postgres).
+                          Prefer DATABASE_URL=… over --to <url>: an argument lands in shell history and ps
   ${C.cyan}sources${C.reset}                 List connectors and their key status
   ${C.cyan}doctor${C.reset}                  Probe every source, write nothing
   ${C.cyan}ingest${C.reset}                  Daily incremental fetch (last 120 days)
   ${C.cyan}backfill${C.reset}                Load deep history (default 25 years)
   ${C.cyan}derive${C.reset}                  Recompute derived series from stored data
   ${C.cyan}score${C.reset}                   Compute composite, pillar and watchlist scores
-  ${C.cyan}daily${C.reset}                   ingest → derive → score (the scheduler entrypoint)
+  ${C.cyan}daily${C.reset}                   ingest → backfill new series → derive → score (the scheduler entrypoint)
   ${C.cyan}health${C.reset}                  Report stale series
   ${C.cyan}alerts${C.reset}                  What is broken and what to run (exit 1 on anything critical)
 
@@ -410,8 +491,17 @@ ${C.bold}Flags${C.reset}
   --only <id,id>          Restrict to named connectors
   --since <YYYY-MM-DD>    Override the start date
   --dry-run               Fetch and parse without writing
-  --no-cache              Bypass the raw response cache
+  --no-cache              Refetch rather than read the raw response cache
   --as-of <YYYY-MM-DD>    Score as of a past date (point-in-time, for backtests)
+
+${C.bold}Database${C.reset}
+  DATABASE_URL=postgres://…        Production store; unset means local SQLite
+  WD_DB_PATH=/path/world.db        SQLite file (default data/world.db)
+
+${C.bold}Raw response cache${C.reset}
+  WD_CACHE_URL=s3://bucket/prefix  S3-compatible store (S3_ENDPOINT, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY)
+  WD_CACHE_URL=file:/dir | none    Directory (default data/cache) or nothing
+  WD_CACHE_RETENTION_DAYS=30       daily prunes entries older than this
 
 ${C.bold}Logging${C.reset} ${C.dim}(structured, on stderr — stdout stays the report above)${C.reset}
   WD_LOG_LEVEL=debug|info|warn|error|silent

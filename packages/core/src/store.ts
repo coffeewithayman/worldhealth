@@ -3,14 +3,6 @@ import type {
   SourceRun, WorldEvent,
 } from './types.js';
 
-export interface CachedResponse {
-  cacheKey: string;
-  sourceId: string;
-  url: string;
-  fetchedAt: string;
-  body: string;
-}
-
 export interface SeriesFilter {
   pillar?: string;
   sourceId?: string;
@@ -31,7 +23,10 @@ export interface EventFilter {
  * change rather than a refactor of every caller.
  */
 export interface Store {
+  /** Apply every pending migration. Idempotent and safe to run concurrently. */
   migrate(): Promise<void>;
+  /** Cheapest possible round trip — what a liveness probe calls. */
+  ping(): Promise<void>;
 
   upsertSeries(defs: SeriesDef[]): Promise<void>;
   listSeries(filter?: SeriesFilter): Promise<SeriesDef[]>;
@@ -55,6 +50,14 @@ export interface Store {
   markSeriesSuccess(seriesIds: string[], at: string): Promise<void>;
   getSeriesHealth(): Promise<SeriesHealth[]>;
 
+  /**
+   * Series whose deep history has been loaded. A series missing from this set
+   * is fetched from `since` 25 years back on the next `daily` — which is how a
+   * source or catalogue entry added in code fills itself in production.
+   */
+  getBackfilledSeries(): Promise<Set<string>>;
+  markBackfilled(seriesIds: string[], at: string, since: IsoDate): Promise<void>;
+
   putScores(scores: ScoreRecord[]): Promise<void>;
   getScores(scoreDate: IsoDate): Promise<ScoreRecord[]>;
   getLatestScoreDate(): Promise<IsoDate | null>;
@@ -62,9 +65,6 @@ export interface Store {
 
   putEvents(events: WorldEvent[]): Promise<number>;
   listEvents(filter?: EventFilter): Promise<WorldEvent[]>;
-
-  cacheGet(cacheKey: string): Promise<CachedResponse | null>;
-  cachePut(entry: CachedResponse): Promise<void>;
 
   close(): Promise<void>;
 }

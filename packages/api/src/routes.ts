@@ -52,9 +52,8 @@ async function requestLog(c: Context, next: () => Promise<void>): Promise<void> 
 /**
  * API routes.
  *
- * Built on Hono specifically so this file runs unmodified on Node today and on
- * Cloudflare Workers later — the only thing that changes on migration is the
- * Store implementation injected here.
+ * Built on Hono, which runs on any JS runtime; the Store injected here is the
+ * only thing that knows which database is underneath.
  *
  * Scores are computed live from stored observations rather than read from the
  * `scores` table, so the dashboard reflects the current config even if you edit
@@ -67,8 +66,20 @@ export function createRoutes(deps: ApiDeps): Hono {
   app.use('/api/*', requestLog);
   app.onError(apiErrorHandler);
 
+  // Whole histories are loaded once and reused: a dashboard request reads
+  // ~127k rows otherwise. Observations only change when the pipeline writes,
+  // and every write stage records a `pipeline_runs` row, so the newest of those
+  // is the cache's version. Without it a long-running server served the
+  // numbers it loaded at boot until someone restarted it.
   const seriesCache = new Map<string, Observation[]>();
+  let cacheVersion: string | null = null;
   const loadSeries = async (ids: string[]): Promise<Map<string, Observation[]>> => {
+    const runs = await deps.store.getLatestPipelineRuns();
+    const version = runs.map((r) => `${r.stage}:${r.id ?? ''}:${r.finishedAt}`).join('|');
+    if (version !== cacheVersion) {
+      seriesCache.clear();
+      cacheVersion = version;
+    }
     const out = new Map<string, Observation[]>();
     for (const id of new Set(ids)) {
       let obs = seriesCache.get(id);
@@ -320,7 +331,10 @@ export function createRoutes(deps: ApiDeps): Hono {
   });
 
   app.get('/api/events', async (c) => {
-    const limit = Number(c.req.query('limit') ?? 100);
+    // Clamped: SQLite reads a negative LIMIT as "no limit", so ?limit=-1 was
+    // an unauthenticated way to pull the whole table in one response.
+    const requested = Math.trunc(Number(c.req.query('limit') ?? 100));
+    const limit = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 500) : 100;
     const category = c.req.query('category') ?? undefined;
     return c.json({ events: await deps.store.listEvents({ limit, category }) });
   });
@@ -394,6 +408,23 @@ export function createRoutes(deps: ApiDeps): Hono {
    * must not get a 503 because a feed is stale. `summary.critical` is the field
    * to alert on, and it is one hop away.
    */
+  /**
+   * Liveness for the platform: 200 when the process can reach its database.
+   *
+   * Deliberately not `/api/health`, which reports on the *data* and runs the
+   * alert engine. A deploy healthcheck must not fail — and roll back a good
+   * release — because an upstream feed is stale.
+   */
+  app.get('/healthz', async (c) => {
+    try {
+      await deps.store.ping();
+      return c.json({ ok: true });
+    } catch (err) {
+      logger.error('healthz: database unreachable', { err });
+      return c.json({ ok: false, error: 'database unreachable' }, 503);
+    }
+  });
+
   app.get('/api/health', async (c) => {
     const pipeline = await deps.store.getLatestPipelineRuns();
     const alerts = await alertsFor();

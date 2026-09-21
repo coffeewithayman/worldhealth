@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { Http, MemoryStore, createLogger } from '@wd/core';
+import { Http, NullCache, createLogger } from '@wd/core';
 import type { FetchCtx } from '@wd/core';
 import { FRED_CATALOG, fredConnector } from './fred.js';
 
@@ -88,12 +88,11 @@ test('retired series are declared but never fetched', async () => {
   }) as typeof fetch;
 
   try {
-    const store = new MemoryStore();
     const logger = createLogger('test', { level: 'silent' });
     const ctx: FetchCtx = {
       since: '2026-05-23',
       today: '2026-09-20',
-      http: new Http(store, 'fred', { defaultCacheTtlHours: 0, userAgent: 'test', noCache: true, logger }),
+      http: new Http(new NullCache(), 'fred', { defaultCacheTtlHours: 0, userAgent: 'test', noCache: true, logger }),
       env: { FRED_API_KEY: 'test-key' },
       log: () => {},
     };
@@ -110,6 +109,34 @@ test('retired series are declared but never fetched', async () => {
       !result.observations.some((o) => o.seriesId === 'us.nonperforming_loans'),
       'a retired series contributes no new observations',
     );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('FRED fetches only the requested series when given a filter', async () => {
+  // How a new catalogue entry is backfilled: one request, not ninety-odd.
+  const requested: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL) => {
+    const id = new URL(String(url)).searchParams.get('series_id');
+    if (id) requested.push(id);
+    return new Response(JSON.stringify({ observations: [{ date: '2001-01-01', value: '1.0' }] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const target = FRED_CATALOG.find((s) => !s.retired)!;
+    const result = await fredConnector.run({
+      since: '2001-09-21',
+      today: '2026-09-21',
+      seriesIds: new Set([target.id]),
+      http: new Http(new NullCache(), 'fred', {
+        defaultCacheTtlHours: 0, userAgent: 'test', noCache: true, logger: createLogger('test', { level: 'silent' }),
+      }),
+      env: { FRED_API_KEY: 'test-key' },
+      log: () => {},
+    });
+    assert.deepEqual(requested, [target.fred]);
+    assert.ok(result.series.some((s) => s.id === target.id));
   } finally {
     globalThis.fetch = realFetch;
   }

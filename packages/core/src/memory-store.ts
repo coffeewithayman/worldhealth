@@ -1,5 +1,5 @@
 import { daysBetween, todayIso } from './dates.js';
-import type { CachedResponse, EventFilter, SeriesFilter, Store } from './store.js';
+import type { EventFilter, SeriesFilter, Store } from './store.js';
 import type {
   IsoDate, Observation, PipelineRun, PipelineStage, ScoreRecord,
   SeriesDef, SeriesHealth, SourceRun, WorldEvent,
@@ -25,10 +25,12 @@ export class MemoryStore implements Store {
   private health = new Map<string, { lastSuccessAt: string }>();
   private scores = new Map<string, ScoreRecord>();
   private events = new Map<string, WorldEvent>();
-  private cache = new Map<string, CachedResponse>();
+  private backfilled = new Map<string, { at: string; since: IsoDate }>();
   closed = false;
 
   async migrate(): Promise<void> { /* nothing to create */ }
+
+  async ping(): Promise<void> { if (this.closed) throw new Error('store closed'); }
 
   async upsertSeries(defs: SeriesDef[]): Promise<void> {
     for (const d of defs) this.series.set(d.id, { ...d });
@@ -38,7 +40,7 @@ export class MemoryStore implements Store {
     return [...this.series.values()]
       .filter((s) => (!filter.pillar || s.pillar === filter.pillar)
         && (!filter.sourceId || s.sourceId === filter.sourceId))
-      .sort((a, b) => a.id.localeCompare(b.id));
+      .sort((a, b) => byteCompare(a.id, b.id));
   }
 
   async getSeries(id: string): Promise<SeriesDef | null> {
@@ -62,7 +64,7 @@ export class MemoryStore implements Store {
     if (!byDate) return [];
     return [...byDate.entries()]
       .filter(([d]) => (!from || d >= from) && (!to || d <= to))
-      .sort((a, b) => a[0].localeCompare(b[0]))
+      .sort((a, b) => byteCompare(a[0], b[0]))
       .map(([obsDate, value]) => ({ seriesId, obsDate, value }));
   }
 
@@ -90,7 +92,7 @@ export class MemoryStore implements Store {
       const seen = latest.get(r.sourceId);
       if (!seen || r.startedAt >= seen.startedAt) latest.set(r.sourceId, r);
     }
-    return [...latest.values()].sort((a, b) => a.sourceId.localeCompare(b.sourceId));
+    return [...latest.values()].sort((a, b) => byteCompare(a.sourceId, b.sourceId));
   }
 
   async recordPipelineRun(run: PipelineRun): Promise<void> {
@@ -103,13 +105,13 @@ export class MemoryStore implements Store {
       const seen = latest.get(r.stage);
       if (!seen || r.startedAt >= seen.startedAt) latest.set(r.stage, r);
     }
-    return [...latest.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+    return [...latest.values()].sort(newestFirst);
   }
 
   async getPipelineRuns(stage?: PipelineStage, limit = 50): Promise<PipelineRun[]> {
     return this.pipeline
       .filter((r) => !stage || r.stage === stage)
-      .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+      .sort(newestFirst)
       .slice(0, limit);
   }
 
@@ -120,7 +122,7 @@ export class MemoryStore implements Store {
   async getSeriesHealth(): Promise<SeriesHealth[]> {
     const today = todayIso();
     return [...this.series.values()]
-      .sort((a, b) => a.id.localeCompare(b.id))
+      .sort((a, b) => byteCompare(a.id, b.id))
       .map((s) => {
         const dates = [...(this.obs.get(s.id)?.keys() ?? [])].sort();
         const lastObsDate = dates.at(-1) ?? null;
@@ -139,6 +141,14 @@ export class MemoryStore implements Store {
       });
   }
 
+  async getBackfilledSeries(): Promise<Set<string>> {
+    return new Set(this.backfilled.keys());
+  }
+
+  async markBackfilled(seriesIds: string[], at: string, since: IsoDate): Promise<void> {
+    for (const id of seriesIds) this.backfilled.set(id, { at, since });
+  }
+
   async putScores(scores: ScoreRecord[]): Promise<void> {
     for (const s of scores) this.scores.set(`${s.scoreDate}|${s.key}`, { ...s });
   }
@@ -155,7 +165,7 @@ export class MemoryStore implements Store {
   async getScoreHistory(key: string, from?: IsoDate): Promise<Array<{ scoreDate: IsoDate; value: number }>> {
     return [...this.scores.values()]
       .filter((s) => s.key === key && (!from || s.scoreDate >= from))
-      .sort((a, b) => a.scoreDate.localeCompare(b.scoreDate))
+      .sort((a, b) => byteCompare(a.scoreDate, b.scoreDate))
       .map((s) => ({ scoreDate: s.scoreDate, value: s.value }));
   }
 
@@ -167,16 +177,9 @@ export class MemoryStore implements Store {
   async listEvents(filter: EventFilter = {}): Promise<WorldEvent[]> {
     return [...this.events.values()]
       .filter((e) => (!filter.category || e.category === filter.category) && (!filter.since || e.ts >= filter.since))
-      .sort((a, b) => b.ts.localeCompare(a.ts))
+      // Ties broken by id, as in the SQL stores: GDELT stamps many events alike.
+      .sort((a, b) => byteCompare(b.ts, a.ts) || byteCompare(a.id, b.id))
       .slice(0, filter.limit ?? 200);
-  }
-
-  async cacheGet(cacheKey: string): Promise<CachedResponse | null> {
-    return this.cache.get(cacheKey) ?? null;
-  }
-
-  async cachePut(entry: CachedResponse): Promise<void> {
-    this.cache.set(entry.cacheKey, { ...entry });
   }
 
   async close(): Promise<void> { this.closed = true; }
@@ -186,6 +189,22 @@ export class MemoryStore implements Store {
   /** Every run recorded, in write order — `getLatestRuns` only shows the last. */
   allRuns(): SourceRun[] { return [...this.runs]; }
   allPipelineRuns(): PipelineRun[] { return [...this.pipeline]; }
-  /** Cache keys are hashed by `Http`; this is how a test finds what it wrote. */
-  cacheKeys(): string[] { return [...this.cache.keys()]; }
+}
+
+/**
+ * Newest first, ties broken by id. `daily` and the `ingest` it wraps start in
+ * the same millisecond, so without the tiebreak their order is whatever the
+ * engine happens to return — and differs between SQLite and Postgres.
+ */
+function newestFirst(a: PipelineRun, b: PipelineRun): number {
+  return byteCompare(b.startedAt, a.startedAt) || (b.id ?? 0) - (a.id ?? 0);
+}
+
+/**
+ * Code-unit order, which is what SQLite and the C-collated Postgres columns
+ * use. `localeCompare` ignores punctuation, so it put `us_a` before `us.a_b`
+ * and made this double disagree with every real store about id order.
+ */
+function byteCompare(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }

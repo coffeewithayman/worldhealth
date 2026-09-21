@@ -6,6 +6,7 @@
   "main": "./dist/cli.js",
   "dependencies": {
     "@wd/core": "*",
+    "@wd/store": "*",
     "@wd/connectors": "*"
   }
 }

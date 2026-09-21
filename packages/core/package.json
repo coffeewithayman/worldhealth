@@ -9,10 +9,6 @@
     ".": "./dist/index.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.7.0",
     "yaml": "^2.6.1"
-  },
-  "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12"
   }
 }

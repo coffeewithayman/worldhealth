@@ -4,6 +4,18 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src/**/*"],
-  "references": [{ "path": "../core" }, { "path": "../connectors" }]
+  "include": [
+    "src/**/*"
+  ],
+  "references": [
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../store"
+    },
+    {
+      "path": "../connectors"
+    }
+  ]
 }

@@ -6,6 +6,7 @@
   "description": "Global economic health dashboard from a sound-money perspective, with depression early-warning indicators",
   "workspaces": [
     "packages/core",
+    "packages/store",
     "packages/connectors",
     "packages/ingest",
     "packages/api",
@@ -15,6 +16,7 @@
     "build": "tsc --build",
     "clean": "tsc --build --clean && rm -rf data/world.db",
     "migrate": "npm run build && node packages/ingest/dist/cli.js migrate",
+    "copy-store": "npm run build && node packages/ingest/dist/cli.js copy-store",
     "doctor": "npm run build && node packages/ingest/dist/cli.js doctor",
     "ingest": "npm run build && node packages/ingest/dist/cli.js ingest",
     "backfill": "npm run build && node packages/ingest/dist/cli.js backfill",
@@ -23,9 +25,6 @@
     "sources": "npm run build && node packages/ingest/dist/cli.js sources",
     "alerts": "npm run build && node packages/ingest/dist/cli.js alerts",
     "api": "npm run build && node packages/api/dist/server.js",
-    "snapshot": "npm run build && npm -w @wd/web run build && node packages/api/dist/snapshot.js",
-    "cf:deploy": "npm run snapshot && npx wrangler deploy",
-    "cf:preview": "npm run snapshot && npx wrangler dev",
     "web": "npm -w @wd/web run dev",
     "dev": "npm run build && concurrently -n api,web -c cyan,magenta \"node packages/api/dist/server.js\" \"npm -w @wd/web run dev\"",
     "test": "npm run build && WD_LOG_LEVEL=${WD_LOG_LEVEL:-silent} node --test packages/*/dist/**/*.test.js"

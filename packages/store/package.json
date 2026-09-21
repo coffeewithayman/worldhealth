@@ -1,0 +1,21 @@
+{
+  "name": "@wd/store",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "dependencies": {
+    "@wd/core": "*",
+    "aws4fetch": "^1.0.20",
+    "better-sqlite3": "^11.7.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/pg": "^8.11.10"
+  }
+}
