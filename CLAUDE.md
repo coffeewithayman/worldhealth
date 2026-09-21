@@ -15,6 +15,9 @@ npm run sources        # connector list + which are disabled for a missing key
 npm run alerts         # what is broken and the command that fixes it; exit 1 if critical
 npm run api            # Hono server on :8787
 npm run dev            # api + Vite dev server (:5173, proxies /api to :8787)
+npm run snapshot       # build web + render every API response into dist-cloudflare/
+npm run cf:preview     # snapshot, then wrangler dev
+npm run cf:deploy      # snapshot, then wrangler deploy — the ONLY way prod changes
 ```
 
 Run a single test by name pattern against the built output:
@@ -29,6 +32,8 @@ Things the npm scripts do not cover:
 - **Web is type-checked separately**: `npm -w @wd/web exec tsc -- --noEmit`. Nothing in `npm run build` or `npm test` catches a type error in `packages/web`.
 - **`derive` and `health` are CLI subcommands with no npm script**: `node packages/ingest/dist/cli.js derive` (recompute derived series without refetching), `... health` (list stale series).
 - `npm run api` exits if `data/world.db` is absent — migrate first.
+- **`npm run migrate` is rarely needed on its own.** `withStore()` in `ingest/src/cli.ts` calls `store.migrate()` on every CLI invocation, so `daily` applies a new column before the ingest that writes it.
+- **`npm run snapshot` needs `data/world.db`**, because it renders the real routes against the real database. It cannot run anywhere the 300 MB gitignored DB is absent — which is why there is no deploy-on-push.
 
 CLI flags (ingest/backfill/doctor/score): `--only <id,id>`, `--since YYYY-MM-DD`, `--dry-run`, `--no-cache`, `--as-of YYYY-MM-DD` (point-in-time scoring, for backtests).
 
@@ -44,9 +49,12 @@ packages/core/           types, Store interface, scoring, derived series, stats,
                          alerts (alerts.ts), logging (log.ts), MemoryStore (test double)
 packages/connectors/     one module per upstream source, uniform Connector interface
 packages/ingest/         CLI: migrate, doctor, ingest, backfill, derive, score, daily, health
-packages/api/            Hono routes; Node today, Workers later unchanged
+packages/api/            Hono routes (routes.ts) + server.ts (Node) + snapshot.ts and
+                         worker.ts (Cloudflare read path)
 packages/web/            React + Vite, hash routing, hand-rolled SVG charts
+wrangler.jsonc           Worker config: one ASSETS binding, no secrets, no nodejs_compat
 data/world.db            SQLite (gitignored)
+dist-cloudflare/         generated snapshot — web bundle + api/*.json (gitignored)
 ```
 
 **Everything is a time series.** Every connector — SDMX, ArcGIS, XML, CSV, JSON — normalises to `Observation { seriesId, obsDate, value }`. Storage, scoring, charting and staleness are written once, not once per source. Resist any design that needs a source-specific path through the pipeline.
@@ -54,6 +62,16 @@ data/world.db            SQLite (gitignored)
 **The pipeline** is ingest → derive → score. Connectors write raw series; `DERIVATIONS` in `core/src/derived.ts` compute analysis series from stored data (`d.*` ids); `core/src/scoring.ts` turns config-declared indicators into 0–100 stress scores, aggregates to pillars, then to a composite. `core/src/watchlist.ts` evaluates the depression precursors, which stay deliberately *outside* the weighted composite.
 
 **Series-id namespaces** are by origin, not by pillar: `us.` `em.` `fx.` `metal.` `oil.` `gas.` `cmd.` `semi.` `mkt.` `crypto.` (connector-written), `ust.` (Treasury curve), and `d.` for everything derived. A `d.` id that no derivation produces silently scores nothing.
+
+**Deployment is split, and the split is the thing to remember.** Cloudflare serves the **read path only**: a Worker (`api/src/worker.ts`) over a Static Assets bundle holding the web build plus one JSON file per API response. The **write path — ingest → derive → score — does not run on Cloudflare at all**; it is the same Node CLI on the local systemd timer (`scripts/install-timer.sh`), writing to the local `data/world.db`. This is fallback #2 from `docs/deploy-cloudflare.md` §7, taken because three free-plan limits (rows read per request, rows written per day, subrequests per invocation) rule out the on-platform pipeline in §2–§4.
+
+Consequences worth holding in mind before changing anything:
+
+- **A commit changes nothing in production.** There is deliberately no deploy-on-push: Workers Builds cannot run a build that needs the 300 MB gitignored `data/world.db`, and a commit is the wrong trigger anyway — the data changes daily, the code does not. `npm run cf:deploy` is the only thing that moves prod, and it must run somewhere the database exists. The README points at the systemd `ExecStartPost=` hook as the right place to automate it.
+- **Prod freshness is downstream of the local timer.** A snapshot is only as current as the last `daily` run that fed it. If the timer is not firing, redeploying just republishes the same stale numbers.
+- **`snapshot.ts` drives the real routes** through Hono's `app.request()`, so the published bytes are what `npm run api` serves by construction. Never reassemble a payload by hand there — that is a second implementation of the dashboard, and the one that drifts.
+- **The Worker imports nothing.** No `@wd/core`, no Hono, hence no `nodejs_compat`. Keep it that way; it is what makes the bundle 2 KiB and free of Node built-ins.
+- A new API route needs adding to `snapshot.ts`'s route list as well as to `routes.ts`, or it 404s in prod while working perfectly under `npm run api`.
 
 **Ordering:** `DERIVATIONS` order is semantic — a derivation may read a series computed earlier in the same pass (`d.gold_breadth` needs the per-currency `d.gold.*` above it). The `CONNECTORS` registry order is cosmetic only; connectors run concurrently.
 
