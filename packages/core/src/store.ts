@@ -31,7 +31,10 @@ export interface EventFilter {
  * change rather than a refactor of every caller.
  */
 export interface Store {
+  /** Apply every pending migration. Idempotent and safe to run concurrently. */
   migrate(): Promise<void>;
+  /** Cheapest possible round trip — what a liveness probe calls. */
+  ping(): Promise<void>;
 
   upsertSeries(defs: SeriesDef[]): Promise<void>;
   listSeries(filter?: SeriesFilter): Promise<SeriesDef[]>;

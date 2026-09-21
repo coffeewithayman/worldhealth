@@ -29,7 +29,7 @@ npm run build
 
 cp .env.example .env.local   # optional but strongly recommended — see "API keys"
 
-npm run migrate           # create the SQLite schema
+npm run migrate           # apply schema migrations (local SQLite unless DATABASE_URL is set)
 npm run backfill          # load deep history (needed for percentile scoring)
 npm run daily             # ingest → derive → score
 
@@ -102,7 +102,8 @@ keys in `.env.local`.
 
 | Command | What it does |
 |---|---|
-| `npm run migrate` | Apply the database schema |
+| `npm run migrate` | Apply pending schema migrations — the deploy step |
+| `npm run copy-store -- --from <world.db>` | One-off: copy a local SQLite database into the Postgres at `DATABASE_URL` |
 | `npm run sources` | List connectors and their key status |
 | `npm run doctor` | Probe every source without writing — fastest way to spot a missing key or a changed upstream API |
 | `npm run ingest` | Incremental fetch (last 120 days, absorbing revisions) |
@@ -319,11 +320,12 @@ config/indicators.yaml     THE model — weights, thresholds, transforms
 packages/
   core/         types, Store interface, scoring engine, derived series, stats,
                 quote statistics (quotes.ts) and the markets board (board.ts)
+  store/        SqliteStore, PostgresStore, versioned migrations, createStore()
   connectors/   one module per source, uniform interface
   ingest/       CLI: migrate, doctor, ingest, backfill, derive, score, daily
   api/          Hono API — runs on Node now, Workers later unchanged
   web/          React + Vite dashboard, hand-rolled SVG charts
-data/world.db   SQLite (gitignored)
+data/world.db   local SQLite (gitignored); production uses Postgres
 ```
 
 **Everything is a time series.** Every connector, whatever its wire format (SDMX,
@@ -343,6 +345,21 @@ range, the five-year percentile and the sparkline are all computed in
 `packages/core/src/quotes.ts` and shipped ready to render. The alternative — sending
 decades of observations for a hundred rows and recomputing on every render — is both
 slower and impossible to unit-test.
+
+**Storage is chosen by environment, and changed only by code.** `DATABASE_URL`
+set to a `postgres://` URL selects `PostgresStore`; without it the local SQLite
+file (`WD_DB_PATH`, default `data/world.db`) is used, so a laptop needs no setup.
+Both implement the same `Store` interface and run the same contract tests.
+
+Schema changes are **versioned migrations** in `packages/store/src/migrations.ts`
+— an append-only list, recorded per database in `schema_migrations`, each applied
+once in its own transaction. Every CLI command and the API boot run pending
+migrations (Postgres serialises concurrent runners on an advisory lock), so a
+migration reaches production by being merged, never by someone editing a database.
+Write new columns with the `ID` / `FLOAT` / `TEXT` tokens: they are the three
+places SQLite and Postgres genuinely differ (identity columns, 8-byte floats, and
+byte-order text collation, without which Postgres on a glibc host sorts `us_a`
+before `us.a_b`).
 
 **`raw_cache` is not a performance optimisation.** It stores verbatim upstream
 responses so a parsing bug found on Tuesday can be fixed and re-run against Monday's
@@ -454,13 +471,13 @@ build timestamp and the `asOf` date the payloads were computed for.
 
 The build is local-first but structured so hosting is a swap, not a rewrite:
 
-- All database access goes through the `Store` interface in `packages/core`. The
-  SQLite implementation is one file; D1 or Postgres is a second file.
-- SQL is deliberately portable — `INSERT … ON CONFLICT DO UPDATE` only, valid in
-  SQLite, Postgres and D1. No SQLite extensions, with one caveat: `source_runs`
-  and `pipeline_runs` use SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT`, which D1
-  accepts (D1 *is* SQLite) but Postgres does not — a Postgres `Store` needs
-  `GENERATED ALWAYS AS IDENTITY` there instead.
+- All database access goes through the `Store` interface in `packages/core`, with
+  SQLite and Postgres implementations in `packages/store`, selected by
+  `DATABASE_URL`.
+- SQL is deliberately portable — `INSERT … ON CONFLICT DO UPDATE` only, TEXT for
+  dates, no extensions — and the dialect differences are confined to three type
+  tokens in the migrations. A SQLite and a Postgres API over the same data return
+  byte-identical responses on every route.
 - The API is Hono, which runs unmodified on Node and on Cloudflare Workers.
 - Every `Store` method is async even though SQLite is synchronous, so call sites
   already await.
@@ -557,8 +574,8 @@ catalogue). Retired series are not fetched, are never counted as stale, and are
 excluded from the per-source "N of M past their budget" denominator, so *all* series
 of a source being stale keeps meaning the feed is dead. Their history stays in the
 database and still scores in an `--as-of` backtest inside the window they covered.
-The column arrives on an existing database through `ADDED_COLUMNS` in
-`core/src/schema.ts`, applied by `npm run migrate`.
+The column arrives on an existing database through migration 2
+(`series_retired_at`) in `packages/store/src/migrations.ts`.
 
 Retiring is not the same as replacing. `NPTLTL`'s closest live substitute is
 `DRALACBN` (delinquency rate on all loans, all commercial banks); adding it is a new
@@ -570,10 +587,14 @@ bundled with the retirement.
 ## Testing
 
 ```bash
-npm test        # 120 tests: transforms, point-in-time discipline, aggregation,
+npm test        # transforms, point-in-time discipline, aggregation,
                 #            watchlist, quote statistics, board integrity,
-                #            alerting, logging, HTTP retry/redaction, both Store
-                #            implementations, connector isolation, API routes
+                #            alerting, logging, HTTP retry/redaction, every Store
+                #            implementation, migrations, connector isolation, API routes
+
+# the same suite, with the Store contract tests also run against Postgres
+docker run -d --rm --name wd-pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:16
+WD_TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres npm test
 npm run doctor  # probe every upstream source, write nothing
 npm run alerts  # what is broken right now, exit 1 if anything is critical
 ```
@@ -588,8 +609,11 @@ The failure-path tests are there for the same reason: that one broken connector 
 not stop the other thirty, that a stage which throws still leaves a row saying so and
 still exits non-zero, that a route which throws returns a labelled 500 instead of an
 empty body, and that a credential never survives a log line or an error message.
-`MemoryStore` is tested against `SqliteStore` with the same assertions, because the
-fast in-memory store is only evidence about production while the two agree.
+`MemoryStore`, `SqliteStore` and `PostgresStore` run the same assertions, because
+the fast in-memory store is only evidence about production while all three agree.
+Each Postgres case gets its own schema, so one server serves the whole suite. Use
+the Debian `postgres:16` image rather than Alpine: musl happens to sort text
+bytewise, which hides exactly the collation bug the tests exist to catch.
 
 Set `WD_LOG_LEVEL=debug` to see the pipeline's own logs while a test runs; the suite
 silences them by default.

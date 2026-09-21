@@ -2,7 +2,13 @@
 
 **Target: Postgres + a separate cron service, ~$5–12/month on Hobby.**
 
-This is a plan, not a changelog. Nothing here has been executed yet.
+This is a plan, not a changelog. Nothing here has been provisioned yet.
+
+**Status:** §4 and §5 are built. `PostgresStore`, versioned migrations (which
+supersede the `schema.ts` dialect parameter sketched in §4) and `copy-store` live
+in `packages/store`; the SQLite- and Postgres-backed APIs return identical
+responses on every route over the real database. Services (§3) and cutover (§8)
+are not done.
 
 Railway has no free tier — Hobby is $5/month including $5 of usage. This
 document exists to give the cost and the design decisions up front, not to

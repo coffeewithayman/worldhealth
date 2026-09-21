@@ -59,7 +59,7 @@ function envFormat(): 'text' | 'json' {
 }
 
 /** Env vars whose *values* must never appear in output, matched by name. */
-const SECRET_NAME = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)/i;
+const SECRET_NAME = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|DATABASE_URL)/i;
 
 /**
  * Blank every credential we can recognise in an already-serialised line.
@@ -73,7 +73,8 @@ export function scrubSecrets(line: string): string {
   let out = line.replace(
     /\b(api_?key|apikey|access_?token|token|auth|key)=([^&"'\s,}]+)/gi,
     (_m, name: string) => `${name}=REDACTED`,
-  );
+  // A connection string's password, however the URL reached the line.
+  ).replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^:/@\s"']+):[^@\s"']+@/gi, '$1:REDACTED@');
   for (const [name, value] of Object.entries(process.env)) {
     // Short values produce false positives ("1", "true") and are not credentials.
     if (!value || value.length < 8 || !SECRET_NAME.test(name)) continue;

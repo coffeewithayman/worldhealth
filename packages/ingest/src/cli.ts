@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import {
-  SqliteStore, addDays, addYears, collectAlerts, describeError, hasRunFailure, log,
+  addDays, addYears, collectAlerts, describeError, hasRunFailure, log,
   summarizeAlerts, todayIso,
   type Alert, type CompositeScore, type Store, type WatchlistResult,
 } from '@wd/core';
+import {
+  PostgresStore, SqliteStore, copyStore, describeStoreTarget, openStore, resolveStoreTarget,
+} from '@wd/store';
 import { CONNECTORS, connectorHealth, getConnector } from '@wd/connectors';
-import { dbPath, loadEnv } from './config.js';
+import { loadEnv } from './config.js';
 import { runAll, type RunOutcome } from './runner.js';
 import { deriveAll, type DeriveOutcome } from './derive.js';
 import { computeAndStoreScores } from './score.js';
@@ -159,7 +162,7 @@ function printScores(composite: CompositeScore, watchlist: WatchlistResult[], as
 }
 
 async function withStore<T>(fn: (store: Store) => Promise<T>): Promise<T> {
-  const store = new SqliteStore(dbPath());
+  const store = openStore(resolveStoreTarget());
   try {
     await store.migrate();
     return await fn(store);
@@ -174,7 +177,43 @@ async function main(): Promise<void> {
 
   switch (cmd) {
     case 'migrate': {
-      await withStore(async () => { console.log(`${C.green}Schema applied${C.reset} at ${dbPath()}`); });
+      // The deploy step: Railway runs this before a new release takes traffic.
+      const target = resolveStoreTarget();
+      const store = openStore(target);
+      try {
+        const ran = await store.migrateReport();
+        console.log(ran.length
+          ? `${C.green}Applied migration(s) ${ran.join(', ')}${C.reset} to ${describeStoreTarget(target)}`
+          : `${C.green}Schema current${C.reset} at ${describeStoreTarget(target)}`);
+        log.info('migrate', { applied: ran, store: describeStoreTarget(target) });
+      } finally {
+        await store.close();
+      }
+      break;
+    }
+
+    case 'copy-store': {
+      // One-off initial load of a local SQLite history into the production
+      // Postgres. Safe to re-run: rows already in the target are kept.
+      const from = flags.get('from');
+      const to = resolveStoreTarget(flags.has('to') ? { DATABASE_URL: flags.get('to') } : process.env);
+      if (!from || from === 'true') throw new Error('copy-store needs --from <path to world.db>');
+      if (to.kind !== 'postgres') throw new Error('copy-store target must be Postgres: set DATABASE_URL or pass --to');
+      const source = new SqliteStore(from);
+      const target = new PostgresStore({ connectionString: to.connectionString });
+      try {
+        await source.migrate();
+        await target.migrate();
+        console.log(`${C.bold}Copying${C.reset} ${from} → ${describeStoreTarget(to)} ${C.dim}(raw_cache skipped)${C.reset}\n`);
+        const copied = await copyStore(source, target, (p) => {
+          if (process.stdout.isTTY) process.stdout.write(`\r  ${p.table.padEnd(16)} ${p.copied}/${p.total}`);
+        });
+        if (process.stdout.isTTY) process.stdout.write('\n');
+        for (const c of copied) console.log(`  ${C.green}ok${C.reset} ${c.table.padEnd(16)} ${c.rows} rows`);
+      } finally {
+        await source.close();
+        await target.close();
+      }
       break;
     }
 
@@ -395,7 +434,8 @@ async function main(): Promise<void> {
       console.log(`
 ${C.bold}world-dashboard ingest CLI${C.reset}
 
-  ${C.cyan}migrate${C.reset}                 Apply the database schema
+  ${C.cyan}migrate${C.reset}                 Apply pending schema migrations (the deploy step)
+  ${C.cyan}copy-store${C.reset} --from <db>     One-off: copy a local SQLite DB into DATABASE_URL (Postgres)
   ${C.cyan}sources${C.reset}                 List connectors and their key status
   ${C.cyan}doctor${C.reset}                  Probe every source, write nothing
   ${C.cyan}ingest${C.reset}                  Daily incremental fetch (last 120 days)
@@ -412,6 +452,10 @@ ${C.bold}Flags${C.reset}
   --dry-run               Fetch and parse without writing
   --no-cache              Bypass the raw response cache
   --as-of <YYYY-MM-DD>    Score as of a past date (point-in-time, for backtests)
+
+${C.bold}Database${C.reset}
+  DATABASE_URL=postgres://…        Production store; unset means local SQLite
+  WD_DB_PATH=/path/world.db        SQLite file (default data/world.db)
 
 ${C.bold}Logging${C.reset} ${C.dim}(structured, on stderr — stdout stays the report above)${C.reset}
   WD_LOG_LEVEL=debug|info|warn|error|silent

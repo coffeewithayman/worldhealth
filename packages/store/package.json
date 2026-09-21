@@ -1,5 +1,5 @@
 {
-  "name": "@wd/core",
+  "name": "@wd/store",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,6 +9,12 @@
     ".": "./dist/index.js"
   },
   "dependencies": {
-    "yaml": "^2.6.1"
+    "@wd/core": "*",
+    "better-sqlite3": "^11.7.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/pg": "^8.11.10"
   }
 }

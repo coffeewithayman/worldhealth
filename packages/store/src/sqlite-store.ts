@@ -1,13 +1,18 @@
 import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { ADDED_COLUMNS, SCHEMA_STATEMENTS } from './schema.js';
-import type { CachedResponse, EventFilter, SeriesFilter, Store } from './store.js';
-import type {
-  Cadence, IsoDate, Observation, Pillar, PipelineRun, PipelineStage, ScoreKind, ScoreRecord,
-  SeriesDef, SeriesHealth, SourceRun, WorldEvent,
-} from './types.js';
-import { daysBetween, todayIso } from './dates.js';
+import {
+  daysBetween, todayIso,
+  type CachedResponse, type EventFilter, type SeriesFilter, type Store,
+  type Cadence, type IsoDate, type Observation, type Pillar, type PipelineRun, type PipelineStage,
+  type ScoreKind, type ScoreRecord, type SeriesDef, type SeriesHealth, type SourceRun, type WorldEvent,
+} from '@wd/core';
+import { MIGRATIONS, MIGRATIONS_TABLE_DDL, type MigrationContext } from './migrations.js';
+
+/** Tables `copy-store` carries across, in dependency-free order. */
+export const COPYABLE_TABLES = [
+  'series', 'observations', 'source_runs', 'pipeline_runs', 'series_health', 'scores', 'events',
+] as const;
 
 interface SeriesRow {
   id: string; name: string; unit: string; cadence: string; source_id: string;
@@ -67,14 +72,56 @@ export class SqliteStore implements Store {
   }
 
   async migrate(): Promise<void> {
-    for (const stmt of SCHEMA_STATEMENTS) this.db.exec(stmt);
-    // `CREATE TABLE IF NOT EXISTS` leaves an existing table untouched, so a
-    // column added after a database was created only arrives this way.
-    for (const c of ADDED_COLUMNS) {
-      const existing = this.db.prepare(`PRAGMA table_info(${c.table})`).all() as Array<{ name: string }>;
-      if (existing.some((col) => col.name === c.column)) continue;
-      this.db.exec(`ALTER TABLE ${c.table} ADD COLUMN ${c.column} ${c.definition}`);
+    await this.migrateReport();
+  }
+
+  /** `migrate()` that also says which migrations it applied. */
+  async migrateReport(): Promise<number[]> {
+    const db = this.db;
+    db.exec(MIGRATIONS_TABLE_DDL);
+    const applied = new Set(
+      (db.prepare('SELECT id FROM schema_migrations').all() as Array<{ id: number }>).map((r) => r.id),
+    );
+    const ctx: MigrationContext = {
+      dialect: 'sqlite',
+      async exec(sql) { db.exec(sql); },
+      async columnExists(table, column) {
+        const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+        return cols.some((c) => c.name === column);
+      },
+    };
+    const ran: number[] = [];
+    for (const m of MIGRATIONS) {
+      if (applied.has(m.id)) continue;
+      // Manual BEGIN/COMMIT: better-sqlite3's transaction() wants a sync body,
+      // and a migration body is async (it is shared with Postgres). Every call
+      // inside is synchronous underneath, so nothing interleaves.
+      db.exec('BEGIN');
+      try {
+        await m.up(ctx);
+        db.prepare('INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)')
+          .run(m.id, m.name, new Date().toISOString());
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      ran.push(m.id);
     }
+    return ran;
+  }
+
+  /** Every row of a table, lazily — the read half of `copy-store`. */
+  *iterateTable(table: (typeof COPYABLE_TABLES)[number]): IterableIterator<Record<string, unknown>> {
+    yield* this.db.prepare(`SELECT * FROM ${table}`).iterate() as IterableIterator<Record<string, unknown>>;
+  }
+
+  countRows(table: (typeof COPYABLE_TABLES)[number]): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+  }
+
+  async ping(): Promise<void> {
+    this.db.prepare('SELECT 1').get();
   }
 
   async upsertSeries(defs: SeriesDef[]): Promise<void> {
@@ -230,15 +277,15 @@ export class SqliteStore implements Store {
       JOIN (
         SELECT stage, MAX(started_at) AS mx FROM pipeline_runs GROUP BY stage
       ) m ON m.stage = p.stage AND m.mx = p.started_at
-      ORDER BY p.started_at DESC
+      ORDER BY p.started_at DESC, p.id DESC
     `).all() as PipelineRunRow[];
     return rows.map(toPipelineRun);
   }
 
   async getPipelineRuns(stage?: PipelineStage, limit = 50): Promise<PipelineRun[]> {
     const rows = stage
-      ? this.db.prepare('SELECT * FROM pipeline_runs WHERE stage = ? ORDER BY started_at DESC LIMIT ?').all(stage, limit)
-      : this.db.prepare('SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT ?').all(limit);
+      ? this.db.prepare('SELECT * FROM pipeline_runs WHERE stage = ? ORDER BY started_at DESC, id DESC LIMIT ?').all(stage, limit)
+      : this.db.prepare('SELECT * FROM pipeline_runs ORDER BY started_at DESC, id DESC LIMIT ?').all(limit);
     return (rows as PipelineRunRow[]).map(toPipelineRun);
   }
 
@@ -365,7 +412,7 @@ export class SqliteStore implements Store {
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     params.limit = filter.limit ?? 200;
     const rows = this.db.prepare(
-      `SELECT * FROM events ${where} ORDER BY ts DESC LIMIT @limit`,
+      `SELECT * FROM events ${where} ORDER BY ts DESC, id LIMIT @limit`,
     ).all(params) as Array<{
       id: string; ts: string; source_id: string; category: string;
       headline: string; url: string; severity: number; entities: string | null;

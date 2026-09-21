@@ -4,10 +4,6 @@ import { resolve } from 'node:path';
 /** Repo root, resolved from this file's location so the CLI works from any cwd. */
 export const ROOT = resolve(import.meta.dirname, '../../..');
 
-export function dbPath(): string {
-  return process.env.WD_DB_PATH ?? resolve(ROOT, 'data/world.db');
-}
-
 /**
  * Load `.env.local` then `.env` into `process.env` without adding a dependency.
  * First writer wins, so the precedence is: real environment > `.env.local` >

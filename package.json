@@ -6,6 +6,7 @@
   "description": "Global economic health dashboard from a sound-money perspective, with depression early-warning indicators",
   "workspaces": [
     "packages/core",
+    "packages/store",
     "packages/connectors",
     "packages/ingest",
     "packages/api",
@@ -15,6 +16,7 @@
     "build": "tsc --build",
     "clean": "tsc --build --clean && rm -rf data/world.db",
     "migrate": "npm run build && node packages/ingest/dist/cli.js migrate",
+    "copy-store": "npm run build && node packages/ingest/dist/cli.js copy-store",
     "doctor": "npm run build && node packages/ingest/dist/cli.js doctor",
     "ingest": "npm run build && node packages/ingest/dist/cli.js ingest",
     "backfill": "npm run build && node packages/ingest/dist/cli.js backfill",

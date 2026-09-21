@@ -27,7 +27,8 @@ import { existsSync } from 'node:fs';
 import { cp, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { Hono } from 'hono';
-import { log, SqliteStore } from '@wd/core';
+import { log } from '@wd/core';
+import { SqliteStore } from '@wd/store';
 import { apiErrorHandler, createRoutes } from './routes.js';
 
 const logger = log.child('snapshot');
