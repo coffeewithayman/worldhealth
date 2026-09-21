@@ -361,9 +361,26 @@ places SQLite and Postgres genuinely differ (identity columns, 8-byte floats, an
 byte-order text collation, without which Postgres on a glibc host sorts `us_a`
 before `us.a_b`).
 
-**`raw_cache` is not a performance optimisation.** It stores verbatim upstream
-responses so a parsing bug found on Tuesday can be fixed and re-run against Monday's
-exact bytes without burning a rate-limited quota.
+**The raw response cache is not a performance optimisation.** It stores verbatim
+upstream responses so a parsing bug found on Tuesday can be fixed and re-run against
+Monday's exact bytes without burning a rate-limited quota. It is kept **outside the
+database** — the bodies were ~60% of the old SQLite file, are rarely read, and refill
+themselves — in whatever `WD_CACHE_URL` names:
+
+| `WD_CACHE_URL` | Where |
+|---|---|
+| unset | `data/cache/` — gzipped JSON files, the local default |
+| `s3://bucket/prefix` | Any S3-compatible store (AWS S3, Cloudflare R2, Railway Buckets, MinIO), with `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, optional `S3_REGION` (R2 wants `auto`) and `S3_URL_STYLE=virtual` |
+| `file:/dir` | A directory of your choosing |
+| `none` | Nothing is kept |
+
+`npm run daily` prunes entries older than `WD_CACHE_RETENTION_DAYS` (default 30),
+in the app rather than as a bucket lifecycle rule so it behaves the same on every
+host. A cache that is unreachable costs a refetch and a warning, never a failed
+connector. `doctor` writes nothing to it.
+
+Migration 3 drops the old `raw_cache` table. SQLite does not hand the space back on
+its own; run `sqlite3 data/world.db 'VACUUM'` once afterwards to shrink the file.
 
 ### Deployment
 
@@ -592,9 +609,14 @@ npm test        # transforms, point-in-time discipline, aggregation,
                 #            alerting, logging, HTTP retry/redaction, every Store
                 #            implementation, migrations, connector isolation, API routes
 
-# the same suite, with the Store contract tests also run against Postgres
+# the same suite, with the Store and cache contract tests also run against
+# Postgres and an S3-compatible store
 docker run -d --rm --name wd-pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:16
-WD_TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres npm test
+docker run -d --rm --name wd-s3 -p 59000:9000 -e MINIO_ROOT_USER=wdtest \
+  -e MINIO_ROOT_PASSWORD=wdtest-secret quay.io/minio/minio server /data
+WD_TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres \
+WD_TEST_S3_ENDPOINT=http://localhost:59000 WD_TEST_S3_ACCESS_KEY_ID=wdtest \
+WD_TEST_S3_SECRET_ACCESS_KEY=wdtest-secret npm test
 npm run doctor  # probe every upstream source, write nothing
 npm run alerts  # what is broken right now, exit 1 if anything is critical
 ```

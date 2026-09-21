@@ -1,7 +1,7 @@
 import pg from 'pg';
 import {
   daysBetween, todayIso,
-  type CachedResponse, type EventFilter, type SeriesFilter, type Store,
+  type EventFilter, type SeriesFilter, type Store,
   type Cadence, type IsoDate, type Observation, type Pillar, type PipelineRun, type PipelineStage,
   type ScoreKind, type ScoreRecord, type SeriesDef, type SeriesHealth, type SourceRun, type WorldEvent,
 } from '@wd/core';
@@ -513,26 +513,6 @@ export class PostgresStore implements Store {
       severity: r.severity,
       entities: r.entities ? (safeParse(r.entities) as string[]) : undefined,
     }));
-  }
-
-  async cacheGet(cacheKey: string): Promise<CachedResponse | null> {
-    const { rows } = await this.pool.query<{
-      cache_key: string; source_id: string; url: string; fetched_at: string; body: string;
-    }>('SELECT * FROM raw_cache WHERE cache_key = $1', [cacheKey]);
-    const r = rows[0];
-    return r
-      ? { cacheKey: r.cache_key, sourceId: r.source_id, url: r.url, fetchedAt: r.fetched_at, body: r.body }
-      : null;
-  }
-
-  async cachePut(entry: CachedResponse): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO raw_cache (cache_key, source_id, url, fetched_at, body)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (cache_key) DO UPDATE SET
-         fetched_at = excluded.fetched_at, body = excluded.body`,
-      [entry.cacheKey, entry.sourceId, entry.url, entry.fetchedAt, entry.body],
-    );
   }
 
   /* ------------------------------------------------ copy-store (write half) */

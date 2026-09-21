@@ -172,6 +172,17 @@ export const MIGRATIONS: Migration[] = [
       await addColumnIfMissing(ctx, 'series', 'retired_at', types(ctx.dialect).TEXT);
     },
   },
+  {
+    id: 3,
+    name: 'drop_raw_cache',
+    // Upstream bodies moved to a ResponseCache (object store or directory,
+    // `WD_CACHE_URL`). They were ~60% of the database, rarely read, and refill
+    // themselves on the next fetch, so nothing is carried across.
+    async up(ctx) {
+      await ctx.exec('DROP INDEX IF EXISTS idx_raw_cache_source');
+      await ctx.exec('DROP TABLE IF EXISTS raw_cache');
+    },
+  },
 ];
 
 /** The table `migrate()` records applied ids in. Identical in both dialects. */

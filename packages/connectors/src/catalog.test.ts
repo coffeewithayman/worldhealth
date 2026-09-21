@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { Http, MemoryStore, createLogger } from '@wd/core';
+import { Http, NullCache, createLogger } from '@wd/core';
 import type { FetchCtx } from '@wd/core';
 import { FRED_CATALOG, fredConnector } from './fred.js';
 
@@ -88,12 +88,11 @@ test('retired series are declared but never fetched', async () => {
   }) as typeof fetch;
 
   try {
-    const store = new MemoryStore();
     const logger = createLogger('test', { level: 'silent' });
     const ctx: FetchCtx = {
       since: '2026-05-23',
       today: '2026-09-20',
-      http: new Http(store, 'fred', { defaultCacheTtlHours: 0, userAgent: 'test', noCache: true, logger }),
+      http: new Http(new NullCache(), 'fred', { defaultCacheTtlHours: 0, userAgent: 'test', noCache: true, logger }),
       env: { FRED_API_KEY: 'test-key' },
       log: () => {},
     };

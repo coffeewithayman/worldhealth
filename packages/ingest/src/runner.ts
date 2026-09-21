@@ -1,6 +1,6 @@
 import {
-  describeError, Http, log, todayIso,
-  type Connector, type FetchCtx, type RunStatus, type Store,
+  describeError, Http, log, NullCache, todayIso,
+  type Connector, type ResponseCache, type FetchCtx, type RunStatus, type Store,
 } from '@wd/core';
 
 export interface RunOptions {
@@ -9,6 +9,8 @@ export interface RunOptions {
   noCache?: boolean;
   /** Run connectors that need a missing key anyway, to see them fail explicitly. */
   force?: boolean;
+  /** Where raw responses are kept. Omitted means nothing is cached. */
+  cache?: ResponseCache;
 }
 
 export interface RunOutcome {
@@ -74,7 +76,9 @@ export async function runConnector(
     since: opts.since,
     today: todayIso(),
     env: process.env,
-    http: new Http(store, connector.id, {
+    // A dry run must not write anything, and the cache is a write: `doctor`
+    // used to fill it while announcing "(no writes)".
+    http: new Http(opts.dryRun ? new NullCache() : (opts.cache ?? new NullCache()), connector.id, {
       defaultCacheTtlHours: 12,
       userAgent: 'world-dashboard/0.1 (personal research dashboard)',
       noCache: opts.noCache,

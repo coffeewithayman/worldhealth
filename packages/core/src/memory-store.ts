@@ -1,5 +1,5 @@
 import { daysBetween, todayIso } from './dates.js';
-import type { CachedResponse, EventFilter, SeriesFilter, Store } from './store.js';
+import type { EventFilter, SeriesFilter, Store } from './store.js';
 import type {
   IsoDate, Observation, PipelineRun, PipelineStage, ScoreRecord,
   SeriesDef, SeriesHealth, SourceRun, WorldEvent,
@@ -25,7 +25,6 @@ export class MemoryStore implements Store {
   private health = new Map<string, { lastSuccessAt: string }>();
   private scores = new Map<string, ScoreRecord>();
   private events = new Map<string, WorldEvent>();
-  private cache = new Map<string, CachedResponse>();
   closed = false;
 
   async migrate(): Promise<void> { /* nothing to create */ }
@@ -174,14 +173,6 @@ export class MemoryStore implements Store {
       .slice(0, filter.limit ?? 200);
   }
 
-  async cacheGet(cacheKey: string): Promise<CachedResponse | null> {
-    return this.cache.get(cacheKey) ?? null;
-  }
-
-  async cachePut(entry: CachedResponse): Promise<void> {
-    this.cache.set(entry.cacheKey, { ...entry });
-  }
-
   async close(): Promise<void> { this.closed = true; }
 
   /* ----------------------------------------------------------- test helpers */
@@ -189,8 +180,6 @@ export class MemoryStore implements Store {
   /** Every run recorded, in write order — `getLatestRuns` only shows the last. */
   allRuns(): SourceRun[] { return [...this.runs]; }
   allPipelineRuns(): PipelineRun[] { return [...this.pipeline]; }
-  /** Cache keys are hashed by `Http`; this is how a test finds what it wrote. */
-  cacheKeys(): string[] { return [...this.cache.keys()]; }
 }
 
 /**

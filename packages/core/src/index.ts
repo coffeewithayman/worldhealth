@@ -1,5 +1,6 @@
 export * from './types.js';
 export * from './store.js';
+export * from './cache.js';
 export * from './memory-store.js';
 export * from './log.js';
 export * from './dates.js';

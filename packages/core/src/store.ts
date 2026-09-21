@@ -3,14 +3,6 @@ import type {
   SourceRun, WorldEvent,
 } from './types.js';
 
-export interface CachedResponse {
-  cacheKey: string;
-  sourceId: string;
-  url: string;
-  fetchedAt: string;
-  body: string;
-}
-
 export interface SeriesFilter {
   pillar?: string;
   sourceId?: string;
@@ -65,9 +57,6 @@ export interface Store {
 
   putEvents(events: WorldEvent[]): Promise<number>;
   listEvents(filter?: EventFilter): Promise<WorldEvent[]>;
-
-  cacheGet(cacheKey: string): Promise<CachedResponse | null>;
-  cachePut(entry: CachedResponse): Promise<void>;
 
   close(): Promise<void>;
 }

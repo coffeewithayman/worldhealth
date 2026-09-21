@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   daysBetween, todayIso,
-  type CachedResponse, type EventFilter, type SeriesFilter, type Store,
+  type EventFilter, type SeriesFilter, type Store,
   type Cadence, type IsoDate, type Observation, type Pillar, type PipelineRun, type PipelineStage,
   type ScoreKind, type ScoreRecord, type SeriesDef, type SeriesHealth, type SourceRun, type WorldEvent,
 } from '@wd/core';
@@ -427,23 +427,6 @@ export class SqliteStore implements Store {
       severity: r.severity,
       entities: r.entities ? (safeParse(r.entities) as string[]) : undefined,
     }));
-  }
-
-  async cacheGet(cacheKey: string): Promise<CachedResponse | null> {
-    const row = this.db.prepare('SELECT * FROM raw_cache WHERE cache_key = ?').get(cacheKey) as
-      { cache_key: string; source_id: string; url: string; fetched_at: string; body: string } | undefined;
-    return row
-      ? { cacheKey: row.cache_key, sourceId: row.source_id, url: row.url, fetchedAt: row.fetched_at, body: row.body }
-      : null;
-  }
-
-  async cachePut(entry: CachedResponse): Promise<void> {
-    this.db.prepare(`
-      INSERT INTO raw_cache (cache_key, source_id, url, fetched_at, body)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT (cache_key) DO UPDATE SET
-        fetched_at = excluded.fetched_at, body = excluded.body
-    `).run(entry.cacheKey, entry.sourceId, entry.url, entry.fetchedAt, entry.body);
   }
 
   async close(): Promise<void> {

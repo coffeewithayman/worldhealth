@@ -6,6 +6,7 @@ export * from './migrations.js';
 export * from './sqlite-store.js';
 export * from './postgres-store.js';
 export * from './copy.js';
+export * from './cache.js';
 
 /** Repo root, resolved from this file's location so it holds from any cwd. */
 const ROOT = resolve(import.meta.dirname, '../../..');

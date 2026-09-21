@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@wd/core": "*",
+    "aws4fetch": "^1.0.20",
     "better-sqlite3": "^11.7.0",
     "pg": "^8.13.1"
   },

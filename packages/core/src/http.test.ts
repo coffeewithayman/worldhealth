@@ -2,12 +2,12 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { Http, HttpError, parseRetryAfter, redactUrl } from './http.js';
 import { createLogger } from './log.js';
-import { MemoryStore } from './memory-store.js';
+import { MemoryCache } from './cache.js';
 
 const quiet = createLogger('test', { level: 'silent' });
 
-function client(store = new MemoryStore(), noCache = false): Http {
-  return new Http(store, 'test-source', {
+function client(cache = new MemoryCache(), noCache = false): Http {
+  return new Http(cache, 'test-source', {
     defaultCacheTtlHours: 12,
     userAgent: 'test',
     noCache,
@@ -153,7 +153,7 @@ test('getJson reports the body it could not parse, not just "invalid json"', asy
 /* -------------------------------------------------------------------- cache */
 
 test('a cached body is reused and the upstream is not hit again', async () => {
-  const store = new MemoryStore();
+  const store = new MemoryCache();
   const f = stubFetch([ok('first'), ok('second')]);
   try {
     assert.equal(await client(store).getText('https://x.test/a'), 'first');
@@ -163,7 +163,7 @@ test('a cached body is reused and the upstream is not hit again', async () => {
 });
 
 test('--no-cache refetches even with a warm cache', async () => {
-  const store = new MemoryStore();
+  const store = new MemoryCache();
   const f = stubFetch([ok('first'), ok('second')]);
   try {
     await client(store).getText('https://x.test/a');
@@ -173,11 +173,11 @@ test('--no-cache refetches even with a warm cache', async () => {
 
 test('the cached row stores the url without the credential', async () => {
   // `raw_cache` is replayability, and it is also a table someone will read.
-  const store = new MemoryStore();
+  const store = new MemoryCache();
   const f = stubFetch([ok('body')]);
   try {
     await client(store).getText('https://x.test/a?api_key=abcdef123456');
-    const cached = await store.cacheGet(store.cacheKeys()[0]!);
+    const cached = await store.get(store.keys()[0]!);
     assert.ok(cached);
     assert.doesNotMatch(cached!.url, /abcdef123456/);
     assert.match(cached!.url, /REDACTED/);
@@ -195,5 +195,20 @@ test('concurrent requests for the same url share one fetch', async () => {
     assert.equal(a, 'body');
     assert.equal(b, 'body');
     assert.equal(f.calls.length, 1, 'two panels wanting the same series must not double the quota spend');
+  } finally { f.restore(); }
+});
+
+test('a cache that is down costs a refetch, never the fetch itself', async () => {
+  // In production the cache is an object store over the network.
+  const failing = {
+    get: async () => { throw new Error('S3 GET 503'); },
+    put: async () => { throw new Error('S3 PUT 503'); },
+    prune: async () => 0,
+    describe: () => 's3 test',
+  };
+  const f = stubFetch([ok('fresh')]);
+  try {
+    const http = new Http(failing, 'test-source', { defaultCacheTtlHours: 12, userAgent: 'test', logger: quiet });
+    assert.equal(await http.getText('https://x.test/a'), 'fresh');
   } finally { f.restore(); }
 });

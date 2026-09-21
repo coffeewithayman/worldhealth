@@ -21,11 +21,13 @@ npm run cf:preview     # snapshot, then wrangler dev
 npm run cf:deploy      # snapshot, then wrangler deploy — the ONLY way prod changes
 ```
 
-Postgres contract tests run only when `WD_TEST_DATABASE_URL` is set (each case gets its own schema):
+Postgres and S3 contract tests run only when their env vars are set (each case gets its own schema / key prefix):
 
 ```bash
 docker run -d --rm --name wd-pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:16   # Debian, not Alpine — see collation below
-WD_TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres npm test
+docker run -d --rm --name wd-s3 -p 59000:9000 -e MINIO_ROOT_USER=wdtest -e MINIO_ROOT_PASSWORD=wdtest-secret quay.io/minio/minio server /data   # Docker Hub's minio/minio is gone
+WD_TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres \
+WD_TEST_S3_ENDPOINT=http://localhost:59000 WD_TEST_S3_ACCESS_KEY_ID=wdtest WD_TEST_S3_SECRET_ACCESS_KEY=wdtest-secret npm test
 ```
 
 Run a single test by name pattern against the built output:
@@ -55,7 +57,8 @@ npm workspaces, strict TypeScript, ESM + `NodeNext`. Dependency direction is one
 config/indicators.yaml   THE model — weights, thresholds, transforms. Not code.
 packages/core/           types, Store interface, scoring, derived series, stats, quotes, board,
                          alerts (alerts.ts), logging (log.ts), MemoryStore (test double)
-packages/store/          SqliteStore, PostgresStore, migrations.ts, copy.ts, createStore()
+packages/store/          SqliteStore, PostgresStore, migrations.ts, copy.ts, createStore(),
+                         cache.ts (FsCache, S3Cache, createCache — the raw response cache)
 packages/connectors/     one module per upstream source, uniform Connector interface
 packages/ingest/         CLI: migrate, doctor, ingest, backfill, derive, score, daily, health
 packages/api/            Hono routes (routes.ts) + server.ts (Node) + snapshot.ts and
@@ -105,7 +108,7 @@ These are enforced by tests and by deliberate design; breaking one is usually a 
 - **Every `ORDER BY` needs a total order.** `daily` and the `ingest` it wraps share a start millisecond; GDELT stamps many events alike. Without an `id` tiebreak the two engines return ties in different orders — found by diffing a SQLite- and a Postgres-backed API over the real database, which is the check to repeat after touching a store (`copy-store` into a scratch Postgres, run both, compare every route).
 - **A Postgres batch must not repeat a key.** `ON CONFLICT DO UPDATE` refuses to touch one row twice in a statement, where SQLite just overwrites. `PostgresStore` collapses each batch last-wins first (`lastWins`); keep that for any new bulk write.
 - **Credentials never reach a log, an error or the DB.** `core/src/http.ts` `redactUrl()` strips key-ish query params; connector errors are persisted to `source_runs.error` and served by `/api/sources`.
-- **`raw_cache` is replayability, not performance.** It keeps verbatim upstream bodies so a parsing bug can be fixed and re-run against yesterday's exact bytes without burning a free-tier quota. `--no-cache` bypasses it.
+- **The raw response cache is replayability, not performance.** It keeps verbatim upstream bodies so a parsing bug can be fixed and re-run against yesterday's exact bytes without burning a free-tier quota. `--no-cache` skips the read. It is a `ResponseCache` (`core/src/cache.ts`), **not part of `Store`**, and lives where `WD_CACHE_URL` says — `data/cache/` by default, an S3-compatible bucket in production (`S3Cache` signs with `aws4fetch`; keep it off the AWS SDK). `Http` treats a cache failure as a miss plus a warning; a dry run gets a `NullCache`; `daily` prunes past `WD_CACHE_RETENTION_DAYS`. Migration 3 dropped the old `raw_cache` table.
 - **Quote arithmetic is server-side** in `core/src/quotes.ts` — change windows, 52-week range, 5-year percentile, sparkline. A change window shorter than the series' publication gap is omitted rather than forward-filled, and rate-like units report basis points, not a percent of a percent.
 - **The API scores live from `config/indicators.yaml`** on each request; the `scores` table is only read for *history*. Editing weights shows up on refresh without re-running the scorer. **This holds for `npm run api` only.** The Cloudflare deployment serves a precomputed snapshot built by `npm run snapshot`, so there a weight edit changes nothing until `npm run cf:deploy` re-runs it, and `?as_of=` is ignored rather than honoured. Backtests are a local concern. See `docs/deploy-cloudflare.md` §5 and §11.
 - **`WATCHLIST_SERIES` is duplicated** in `packages/api/src/routes.ts` and `packages/ingest/src/score.ts`. A new watchlist rule needs both lists updated or the API and CLI disagree.
@@ -122,7 +125,7 @@ These are enforced by tests and by deliberate design; breaking one is usually a 
 
 ## Configuration and keys
 
-Keys load from `.env.local`, then `.env`, and a real environment variable beats both (`FRED_API_KEY=x npm run ingest` always wins). Blank values are ignored. Everything runs keyless at roughly 40% coverage; `FRED_API_KEY` is by far the biggest unlock (the credit, real-economy and markets pillars are empty without it). Overrides: `DATABASE_URL` (a `postgres://` URL selects Postgres; also accepts `sqlite:<path>`), `WD_DB_PATH`, `WD_CONFIG_PATH`, `PORT`. `DATABASE_URL` is scrubbed from logs like any credential, and any `scheme://user:pass@` in a line has its password blanked.
+Keys load from `.env.local`, then `.env`, and a real environment variable beats both (`FRED_API_KEY=x npm run ingest` always wins). Blank values are ignored. Everything runs keyless at roughly 40% coverage; `FRED_API_KEY` is by far the biggest unlock (the credit, real-economy and markets pillars are empty without it). Overrides: `WD_CACHE_URL` + `S3_*` (raw response cache, see above), `DATABASE_URL` (a `postgres://` URL selects Postgres; also accepts `sqlite:<path>`), `WD_DB_PATH`, `WD_CONFIG_PATH`, `PORT`. `DATABASE_URL` is scrubbed from logs like any credential, and any `scheme://user:pass@` in a line has its password blanked.
 
 `loadScoringConfig()` validates strictly and throws — unknown pillar, non-positive weight, unsorted bands, duplicate series. That is intentional: a model that silently scores fewer inputs than you think is worse than one that refuses to start.
 

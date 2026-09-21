@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { MemoryStore, type Connector, type ConnectorResult, type FetchCtx } from '@wd/core';
+import { MemoryCache, MemoryStore, type Connector, type ConnectorResult, type FetchCtx } from '@wd/core';
 import { runAll, runConnector } from './runner.js';
 
 const SINCE = '2026-01-01';
@@ -150,4 +150,25 @@ test('results come back sorted by source id however they finished', async () => 
   const store = new MemoryStore();
   const results = await runAll([working('z'), working('a'), working('m')], store, { since: SINCE });
   assert.deepEqual(results.map((r) => r.sourceId), ['a', 'm', 'z']);
+});
+
+/* ------------------------------------------------------------------ cache */
+
+test('a dry run leaves the response cache untouched', async () => {
+  // `doctor` announces "(no writes)"; it used to fill raw_cache all the same.
+  const cache = new MemoryCache();
+  const real = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('{"ok":true}', { status: 200 })) as typeof fetch;
+  try {
+    const fetching = connector('f', async (ctx) => {
+      await ctx.http.getText('https://example.test/data');
+      return { series: [], observations: [] };
+    });
+    await runConnector(fetching, new MemoryStore(), { since: SINCE, dryRun: true, cache });
+    assert.deepEqual(cache.keys(), [], 'a dry run must not write');
+    await runConnector(fetching, new MemoryStore(), { since: SINCE, cache });
+    assert.equal(cache.keys().length, 1, 'a real run does');
+  } finally {
+    globalThis.fetch = real;
+  }
 });

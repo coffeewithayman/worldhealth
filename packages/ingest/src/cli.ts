@@ -5,7 +5,7 @@ import {
   type Alert, type CompositeScore, type Store, type WatchlistResult,
 } from '@wd/core';
 import {
-  PostgresStore, SqliteStore, copyStore, describeStoreTarget, openStore, resolveStoreTarget,
+  PostgresStore, SqliteStore, copyStore, createCache, describeStoreTarget, openStore, resolveStoreTarget,
 } from '@wd/store';
 import { CONNECTORS, connectorHealth, getConnector } from '@wd/connectors';
 import { loadEnv } from './config.js';
@@ -161,6 +161,16 @@ function printScores(composite: CompositeScore, watchlist: WatchlistResult[], as
   }
 }
 
+/**
+ * Keep this many days of raw responses. Long enough to replay last week's
+ * bytes after a parser fix; short enough that the bucket does not grow
+ * forever, since nothing else removes an entry whose URL changed.
+ */
+function cacheRetentionDays(): number {
+  const n = Number(process.env.WD_CACHE_RETENTION_DAYS ?? 30);
+  return Number.isFinite(n) && n > 0 ? n : 30;
+}
+
 async function withStore<T>(fn: (store: Store) => Promise<T>): Promise<T> {
   const store = openStore(resolveStoreTarget());
   try {
@@ -254,7 +264,7 @@ async function main(): Promise<void> {
       const results = await withStore((store) => runStage(store, 'ingest', async () => {
         const out = await runAll(
           connectors, store,
-          { since, dryRun, noCache: flags.get('no-cache') === 'true' },
+          { since, dryRun, noCache: flags.get('no-cache') === 'true', cache: createCache() },
           4, printOutcome,
         );
         // A dry run must not leave a row claiming the data was updated.
@@ -274,7 +284,7 @@ async function main(): Promise<void> {
       const results = await withStore((store) => runStage(store, 'backfill', async () => {
         const out = await runAll(
           connectors, store,
-          { since, dryRun, noCache: flags.get('no-cache') === 'true' },
+          { since, dryRun, noCache: flags.get('no-cache') === 'true', cache: createCache() },
           2, printOutcome,
         );
         // A dry run must not leave a row claiming the data was updated.
@@ -333,13 +343,14 @@ async function main(): Promise<void> {
       // The single command a scheduler runs: fetch, derive, then score.
       const since = flags.get('since') ?? addDays(todayIso(), -120);
       console.log(`${C.bold}Daily update${C.reset} ${C.dim}(ingest → derive → score)${C.reset}\n`);
+      const cache = createCache();
       await withStore(async (store) => {
         // The outer stage is the proof the scheduler fired at all. Each inner
         // stage records its own row, so a failure is attributable to the step
         // that failed rather than to "the daily job".
         await runStage(store, 'daily', async () => {
           const results = await runStage(store, 'ingest', async () => {
-            const out = await runAll(CONNECTORS, store, { since }, 4, printOutcome);
+            const out = await runAll(CONNECTORS, store, { since, cache }, 4, printOutcome);
             return { result: out, ...ingestStageResult(out) };
           });
           summarise(results);
@@ -384,6 +395,16 @@ async function main(): Promise<void> {
             detail: { composite: Number.isFinite(composite.score) ? composite.score : null, regime: composite.regime },
           };
         });
+
+        // Outside the stages on purpose: a cache that cannot be pruned is a
+        // storage bill, not a failed update, and must not turn the run red.
+        try {
+          const cutoff = new Date(Date.now() - cacheRetentionDays() * 86_400_000);
+          const pruned = await cache.prune(cutoff);
+          log.info('cache pruned', { cache: cache.describe(), removed: pruned, retentionDays: cacheRetentionDays() });
+        } catch (err) {
+          log.warn('cache prune failed', { err, cache: cache.describe() });
+        }
 
         // The run ends with the same list the dashboard shows, so whoever reads
         // the cron output and whoever opens the page see one story.
@@ -450,12 +471,17 @@ ${C.bold}Flags${C.reset}
   --only <id,id>          Restrict to named connectors
   --since <YYYY-MM-DD>    Override the start date
   --dry-run               Fetch and parse without writing
-  --no-cache              Bypass the raw response cache
+  --no-cache              Refetch rather than read the raw response cache
   --as-of <YYYY-MM-DD>    Score as of a past date (point-in-time, for backtests)
 
 ${C.bold}Database${C.reset}
   DATABASE_URL=postgres://…        Production store; unset means local SQLite
   WD_DB_PATH=/path/world.db        SQLite file (default data/world.db)
+
+${C.bold}Raw response cache${C.reset}
+  WD_CACHE_URL=s3://bucket/prefix  S3-compatible store (S3_ENDPOINT, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY)
+  WD_CACHE_URL=file:/dir | none    Directory (default data/cache) or nothing
+  WD_CACHE_RETENTION_DAYS=30       daily prunes entries older than this
 
 ${C.bold}Logging${C.reset} ${C.dim}(structured, on stderr — stdout stays the report above)${C.reset}
   WD_LOG_LEVEL=debug|info|warn|error|silent
