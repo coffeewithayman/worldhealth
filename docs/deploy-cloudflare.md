@@ -2,7 +2,12 @@
 
 **Target: $0/month, entirely within the Workers free plan.**
 
-This is a plan, not a changelog. Nothing here has been executed yet.
+**Status: §7 fallback #2 is built and is what ships.** The read path — the web
+bundle and a precomputed snapshot of every API response — runs on Cloudflare;
+the pipeline stays on the Node CLI and the local systemd timer. §11 records what
+was built. §2–§4 (the sharded on-platform pipeline) remain an unexecuted plan,
+and §7's measurement gate has **not** been run — the fallback was taken in
+preference to measuring, because it makes the measurement unnecessary.
 
 The README's earlier one-line target — *"Workers + D1 + Pages, with a Cron
 Trigger replacing the systemd timer"* — is not achievable as written on the free
@@ -397,3 +402,60 @@ operations three orders of magnitude under the caps).
 The only spend decision is the §7 fallback: **$5/mo for Workers Paid** buys back
 live scoring, the full-history derive pass, and the deletion of every shard in
 §4. If the sharded design proves fragile in practice, that is the trade to make.
+
+---
+
+## 11. What was actually built
+
+The read-path-only shape from §7's second fallback. Cloudflare serves the
+dashboard and a precomputed copy of every API response; the pipeline was not
+moved and was not modified.
+
+| File | Role |
+|---|---|
+| `packages/api/src/snapshot.ts` | Builds `dist-cloudflare/` — the Vite bundle plus one JSON file per API route |
+| `packages/api/src/worker.ts` | The whole server: maps `/api/<route>` onto `api/<route>.json`, attaches cache headers |
+| `wrangler.jsonc` | `assets.run_worker_first: ["/api/*"]`, one `ASSETS` binding, nothing else |
+| `npm run snapshot` / `cf:preview` / `cf:deploy` | Build, preview through the real Workers runtime, deploy |
+
+### Why the snapshot calls the real routes
+
+`snapshot.ts` mounts `createRoutes` into a Hono app and drives it through
+`app.request()`, which needs no listening socket. The published bytes are
+therefore the bytes `npm run api` serves *by construction*, not by agreement —
+verified byte-identical on `/api/dashboard`, `/api/markets`, `/api/sources` and
+`/api/series/ust.yield.10y` against a running local server. A second
+implementation of the dashboard payload would be a second thing to keep correct,
+and the first one to drift.
+
+### Measured output
+
+| | |
+|---|---|
+| Files published | 338 (318 series + 9 pillars + 7 fixed routes + manifest + bundle) |
+| Total size | 74.6 MB, largest single file 0.6 MB |
+| Build time | ~4 s from a warm `data/world.db` |
+| Worker bundle | 2.13 KiB, zero imports, no `nodejs_compat` |
+| Bindings | `ASSETS` only — no secrets, confirmed by `wrangler deploy --dry-run` |
+
+Against the §1 caps that ruled out the naive shape: 338 files of 20,000, 0.6 MB
+of 25 MiB per file. None of the three blockers apply, because nothing is
+computed at request time and nothing is written at all.
+
+### Two traps worth recording
+
+- **`not_found_handling: "single-page-application"` would break the API.** Under
+  it, an `ASSETS.fetch()` miss returns **200 with `index.html`**, which sails
+  past an `res.ok` check and hands the dashboard HTML to `res.json()`. The
+  option is left at its default — the web build uses hash routing and never
+  needed it — and `worker.ts` checks the content type anyway.
+- **`compatibility_date` is pinned to the local workerd, not to today.**
+  wrangler 4.110.0 ships a runtime that refuses any date after 2026-07-15, so a
+  date set to "today" deploys fine and makes `npm run cf:preview` fail with a
+  runtime error. Move it when wrangler is upgraded, not before.
+
+### What it does not do
+
+Everything in §5 still applies, and is now real rather than prospective: no live
+scoring, no `?as_of=`. The `CLAUDE.md` invariant carries the caveat. The path
+back to live scoring is unchanged — Workers Paid at $5/mo, per §10.

@@ -1,0 +1,44 @@
+{
+  // Read-path-only deployment: Cloudflare serves the web bundle and a
+  // precomputed API snapshot, nothing else. The ingest → derive → score
+  // pipeline keeps running as the existing Node CLI on a schedule, and
+  // publishes here with `npm run cf:deploy`.
+  //
+  // This is fallback #2 from docs/deploy-cloudflare.md §7, chosen over the
+  // sharded on-platform pipeline in §2–§4: it needs no CloudflareStore, no
+  // connector partitioning and no D1, and none of the three free-plan blockers
+  // in §1 apply to a Worker that only reads static files.
+  "name": "worldhealth",
+  "main": "packages/api/src/worker.ts",
+  // Held at the newest date the locally installed workerd supports, so
+  // `npm run cf:preview` and the deployed Worker run identical semantics.
+  // Nothing here is date-gated — the Worker is a router over static files —
+  // so this only ever needs moving when wrangler itself is upgraded.
+  "compatibility_date": "2026-07-15",
+
+  // No `nodejs_compat`: worker.ts imports nothing at all, so there is no Node
+  // built-in to polyfill. Adding the flag would only grow the bundle.
+
+  "assets": {
+    // Built by `npm run snapshot` — the Vite build plus api/**.json.
+    "directory": "dist-cloudflare",
+    "binding": "ASSETS",
+
+    // The Worker answers every /api request so it can map `/api/dashboard`
+    // onto `api/dashboard.json` and attach cache headers. Everything else —
+    // index.html, the JS and CSS — is served straight from the asset store
+    // without invoking the Worker at all, so it costs no CPU and no request
+    // against the 100,000/day free-plan budget.
+    //
+    // Requires wrangler >= 4.20.0 for the array form.
+    "run_worker_first": ["/api/*"]
+
+    // `not_found_handling` is deliberately left at its default ("none").
+    // The web build uses hash routing, so every deep link is still a request
+    // for "/" and no SPA rewrite is needed — and the "single-page-application"
+    // setting would make a missing asset return 200 + index.html, which
+    // worker.ts would then have to distinguish from a real payload.
+  },
+
+  "observability": { "enabled": true }
+}

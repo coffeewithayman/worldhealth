@@ -75,7 +75,7 @@ These are enforced by tests and by deliberate design; breaking one is usually a 
 - **Credentials never reach a log, an error or the DB.** `core/src/http.ts` `redactUrl()` strips key-ish query params; connector errors are persisted to `source_runs.error` and served by `/api/sources`.
 - **`raw_cache` is replayability, not performance.** It keeps verbatim upstream bodies so a parsing bug can be fixed and re-run against yesterday's exact bytes without burning a free-tier quota. `--no-cache` bypasses it.
 - **Quote arithmetic is server-side** in `core/src/quotes.ts` — change windows, 52-week range, 5-year percentile, sparkline. A change window shorter than the series' publication gap is omitted rather than forward-filled, and rate-like units report basis points, not a percent of a percent.
-- **The API scores live from `config/indicators.yaml`** on each request; the `scores` table is only read for *history*. Editing weights shows up on refresh without re-running the scorer.
+- **The API scores live from `config/indicators.yaml`** on each request; the `scores` table is only read for *history*. Editing weights shows up on refresh without re-running the scorer. **This holds for `npm run api` only.** The Cloudflare deployment serves a precomputed snapshot built by `npm run snapshot`, so there a weight edit changes nothing until `npm run cf:deploy` re-runs it, and `?as_of=` is ignored rather than honoured. Backtests are a local concern. See `docs/deploy-cloudflare.md` §5 and §11.
 - **`WATCHLIST_SERIES` is duplicated** in `packages/api/src/routes.ts` and `packages/ingest/src/score.ts`. A new watchlist rule needs both lists updated or the API and CLI disagree.
 
 ## Adding things

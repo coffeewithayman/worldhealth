@@ -112,6 +112,9 @@ keys in `.env.local`.
 | `npm run alerts` | What is currently broken and what to run. Exits 1 if anything is critical |
 | `npm run api` | Serve the API and the built dashboard |
 | `npm run dev` | API + Vite dev server with hot reload |
+| `npm run snapshot` | Build `dist-cloudflare/` — the web bundle plus every API response as a static file |
+| `npm run cf:preview` | Snapshot, then serve it through the Workers runtime locally |
+| `npm run cf:deploy` | Snapshot, then `wrangler deploy` |
 | `npm test` | Transform, scoring, watchlist, pipeline, logging and API tests |
 
 Useful flags: `--only <id,id>`, `--since YYYY-MM-DD`, `--dry-run`, `--no-cache`,
@@ -345,7 +348,109 @@ slower and impossible to unit-test.
 responses so a parsing bug found on Tuesday can be fixed and re-run against Monday's
 exact bytes without burning a rate-limited quota.
 
-### Deploy later
+### Deployment
+
+**Cloudflare serves the read path.** The pipeline stays where it is — the Node
+CLI on the local systemd timer — and Cloudflare hosts the dashboard and a
+precomputed copy of every API response. This is fallback #2 from
+[docs/deploy-cloudflare.md](docs/deploy-cloudflare.md) §7, taken in preference
+to running the pipeline on Workers: it costs $0, needs no `CloudflareStore`, no
+D1, no connector partitioning, and none of the three free-plan blockers in §1
+apply to a Worker that only reads static files.
+
+#### Deploying
+
+```bash
+npm run cf:preview   # snapshot + the real Workers runtime, locally
+npm run cf:deploy    # snapshot + wrangler deploy
+```
+
+`cf:deploy` is the whole procedure: it rebuilds the TypeScript, rebuilds the web
+bundle, regenerates the snapshot from the current `data/world.db`, and uploads.
+Run it **after** `npm run daily`, never before — it publishes whatever is in the
+database at that moment.
+
+Authenticate first, once per machine:
+
+```bash
+npx wrangler login              # interactive, OAuth
+# or, for anything unattended:
+export CLOUDFLARE_API_TOKEN=... # scope: Workers Scripts:Edit
+```
+
+Prefer the token for automation. The OAuth session expires and cannot refresh in
+a non-interactive shell, which is a silent 07:20 failure waiting to happen if a
+timer ever runs the deploy.
+
+Verify a deploy landed by reading the manifest the snapshot writes:
+
+```bash
+curl -s https://<your-worker>.workers.dev/api/snapshot
+# {"builtAt":"…","asOf":"2026-09-20","routes":334,"series":318,…}
+```
+
+#### There is no deploy on push
+
+Committing changes nothing, and Cloudflare's Git integration cannot be made to
+work here: Workers Builds clones the repo and runs the build, but
+`npm run snapshot` needs `data/world.db` — 300 MB and gitignored — so the build
+would stop at `No database at …`.
+
+That is the shallow reason. The real one is that a commit is the wrong trigger.
+What changes on this site is data, not code: a README edit would republish
+byte-identical payloads, while a `daily` run that ingests new observations
+produces an entirely new dashboard and touches no commit at all. The Worker is
+2 KiB and essentially never changes; the 74.6 MB of snapshot JSON beside it
+changes every morning.
+
+So the trigger belongs on the pipeline, not the repo — an `ExecStartPost=` on
+the `world-dashboard.service` unit in [scripts/install-timer.sh](scripts/install-timer.sh),
+which systemd runs only if `ExecStart` succeeded. Since `daily` exits non-zero
+only when that run actually failed, a broken ingest then leaves yesterday's good
+snapshot published rather than overwriting it with a worse one — the same
+"missing beats wrong" rule the scorer follows. Not wired up yet.
+
+#### How it is built
+
+`npm run snapshot` builds `dist-cloudflare/`: the Vite bundle plus one JSON file
+per API route, including every pillar and all 318 series. It generates those
+files by calling the real routes through Hono's `app.request()` rather than
+reassembling the payloads, so the published bytes are the bytes `npm run api`
+would serve — verified byte-identical, and the reason there is no second
+implementation of the dashboard payload to keep in step.
+
+`packages/api/src/worker.ts` is the entire server: it maps `/api/dashboard` onto
+`api/dashboard.json`, attaches cache headers, and lets everything else fall
+through to the asset store without invoking the Worker at all. It imports
+nothing, so there is no `nodejs_compat` and nothing that can drift from the Node
+build.
+
+Two things in `wrangler.jsonc` that look like defaults but are not:
+
+- **`not_found_handling` is deliberately unset.** Under
+  `"single-page-application"` a missing asset returns *200 with `index.html`*,
+  which would sail past a status check and feed the dashboard HTML to
+  `res.json()`. The web build uses hash routing and never needed it.
+- **`compatibility_date` tracks the installed wrangler, not today.** wrangler
+  4.110.0 bundles a runtime that refuses any date after 2026-07-15, so setting
+  it to the current date still deploys but breaks `npm run cf:preview` with
+  `This Worker requires compatibility date …`. Move it when wrangler is
+  upgraded.
+
+**What this costs you.** Two things that work locally do not work there:
+
+- **Scores are not computed live.** The API invariant that editing
+  `config/indicators.yaml` shows up on refresh holds for `npm run api` only. On
+  Cloudflare a weight edit changes nothing until `npm run cf:deploy` re-runs the
+  snapshot.
+- **`?as_of=` is inert.** A query string does not select a file, so it is
+  ignored rather than honoured. Backtests stay local, which is where
+  `docs/deploy-cloudflare.md` §5 argues they belong anyway.
+
+A stale deploy is diagnosable from the browser: `/api/snapshot` carries the
+build timestamp and the `asOf` date the payloads were computed for.
+
+### Other options
 
 The build is local-first but structured so hosting is a swap, not a rewrite:
 

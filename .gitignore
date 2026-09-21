@@ -8,4 +8,6 @@ data/*.db-shm
 .env
 .env.local
 packages/web/dist/
+dist-cloudflare/
+.wrangler/
 .DS_Store
