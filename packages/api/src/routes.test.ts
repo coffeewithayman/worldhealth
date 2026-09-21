@@ -167,6 +167,19 @@ test('a long-running server picks up new data once the pipeline records a run', 
   assert.match(JSON.stringify((await get('/api/markets')).body), /222\.222/, 'the new run invalidates the cache');
 });
 
+test('the events limit is clamped, so ?limit=-1 cannot pull the whole table', async () => {
+  const store = new MemoryStore();
+  let asked: number | undefined;
+  store.listEvents = async (f = {}) => { asked = f.limit; return []; };
+  const get = app(store);
+  await get('/api/events?limit=-1');
+  assert.equal(asked, 1);
+  await get('/api/events?limit=100000');
+  assert.equal(asked, 500);
+  await get('/api/events?limit=nonsense');
+  assert.equal(asked, 100);
+});
+
 /* ---------------------------------------------------------------- healthz */
 
 test('/healthz is 200 when the database answers and 503 when it does not', async () => {

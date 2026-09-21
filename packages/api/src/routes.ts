@@ -331,7 +331,10 @@ export function createRoutes(deps: ApiDeps): Hono {
   });
 
   app.get('/api/events', async (c) => {
-    const limit = Number(c.req.query('limit') ?? 100);
+    // Clamped: SQLite reads a negative LIMIT as "no limit", so ?limit=-1 was
+    // an unauthenticated way to pull the whole table in one response.
+    const requested = Math.trunc(Number(c.req.query('limit') ?? 100));
+    const limit = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 500) : 100;
     const category = c.req.query('category') ?? undefined;
     return c.json({ events: await deps.store.listEvents({ limit, category }) });
   });

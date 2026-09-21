@@ -475,7 +475,8 @@ async function main(): Promise<void> {
 ${C.bold}world-dashboard ingest CLI${C.reset}
 
   ${C.cyan}migrate${C.reset}                 Apply pending schema migrations (the deploy step)
-  ${C.cyan}copy-store${C.reset} --from <db>     One-off: copy a local SQLite DB into DATABASE_URL (Postgres)
+  ${C.cyan}copy-store${C.reset} --from <db>     One-off: copy a local SQLite DB into DATABASE_URL (Postgres).
+                          Prefer DATABASE_URL=… over --to <url>: an argument lands in shell history and ps
   ${C.cyan}sources${C.reset}                 List connectors and their key status
   ${C.cyan}doctor${C.reset}                  Probe every source, write nothing
   ${C.cyan}ingest${C.reset}                  Daily incremental fetch (last 120 days)

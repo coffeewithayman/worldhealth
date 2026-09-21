@@ -1,3 +1,6 @@
+# LOCAL DEVELOPMENT ONLY. Fixed, weak credentials, and every port is bound to
+# 127.0.0.1 so nothing here is reachable from another machine even if this file
+# is run on a server. Production is Railway (docs/deploy-railway.md).
 services:
   postgres:
     image: postgres:16
@@ -5,7 +8,7 @@ services:
       POSTGRES_PASSWORD: wd
       POSTGRES_DB: wd
     ports:
-      - "55432:5432"
+      - "127.0.0.1:55432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -21,8 +24,8 @@ services:
       MINIO_ROOT_USER: wdlocal
       MINIO_ROOT_PASSWORD: wdlocal-secret
     ports:
-      - "59000:9000"
-      - "59001:9001"
+      - "127.0.0.1:59000:9000"
+      - "127.0.0.1:59001:9001"
     volumes:
       - minio-data:/data
 
@@ -49,7 +52,7 @@ services:
       - path: .env.local
         required: false
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     depends_on:
       postgres:
         condition: service_healthy

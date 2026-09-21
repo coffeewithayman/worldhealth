@@ -199,6 +199,9 @@ export const MIGRATIONS: Migration[] = [
         backfilled_at ${TEXT} NOT NULL,
         since         ${TEXT} NOT NULL
       )`);
+      // Interpolated rather than bound because `ctx.exec` takes no
+      // parameters. Safe only because both values are generated right here;
+      // never copy this pattern with anything that came from outside.
       const now = new Date();
       const cutoff = new Date(now.getTime() - 400 * 86_400_000).toISOString().slice(0, 10);
       await ctx.exec(`INSERT INTO series_backfill (series_id, backfilled_at, since)
