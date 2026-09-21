@@ -95,6 +95,21 @@ interface TimelineResponse {
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * GDELT's stated limit is one request per five seconds. The extra 1.5s is for
+ * clock skew and for the fact that the limiter counts attempts, not successes.
+ */
+const RATE_LIMIT_MS = 6500;
+
+/**
+ * Wait before the second pass.
+ *
+ * Longer than the per-request interval on purpose: by the time a topic has
+ * failed its retries the limiter is already unhappy, and going straight back at
+ * it is what turns one refused request into a refused run.
+ */
+const RETRY_COOLDOWN_MS = 30_000;
+
+/**
  * GDELT DOC 2.0 — global news monitoring.
  *
  * Free and unauthenticated, which is remarkable for what it provides. Used in
@@ -111,6 +126,24 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
  *
  * GDELT asks for no more than one request every five seconds, which this
  * connector respects; a full pass therefore takes roughly 90 seconds.
+ *
+ * Rate limiting is the failure mode that actually bites, and it is worth being
+ * precise about why it costs so much here. `TimelineVol` returns twelve months
+ * in one response, so a topic that succeeds refills its whole series in a
+ * single request and a topic that 429s writes *nothing at all* — not a short
+ * update, nothing. One throttled request is therefore indistinguishable in the
+ * data from a feed that died, and on 2026-09-20 that is exactly what it looked
+ * like: six topics current to the day, `news.devaluation` frozen six weeks back
+ * and `news.emergency_policy` never once ingested.
+ *
+ * Two things keep that from happening quietly:
+ *
+ *  - Retries wait at least a full rate-limit interval. The shared client's
+ *    default curve starts near one second, which for this API guarantees the
+ *    retry is refused too and spends another request doing it.
+ *  - Topics that still failed get a second pass after a cooldown, at the end of
+ *    the run. Only what fails *twice* becomes a warning, so a single throttled
+ *    request no longer marks the whole source `partial`.
  */
 export const gdeltConnector: Connector = {
   id: 'gdelt',
@@ -124,70 +157,114 @@ export const gdeltConnector: Connector = {
     const events: WorldEvent[] = [];
     const observations: Observation[] = [];
     const series: SeriesDef[] = [];
-    const warnings: string[] = [];
+    /** Topic id -> the error from its most recent attempt, cleared on success. */
+    const articleErrors = new Map<string, string>();
+    const timelineErrors = new Map<string, string>();
+
+    const queryFor = (topic: Topic): string =>
+      encodeURIComponent(`${topic.query} sourcelang:english`);
+
+    const fetchArticles = async (topic: Topic): Promise<void> => {
+      const url = 'https://api.gdeltproject.org/api/v2/doc/doc'
+        + `?query=${queryFor(topic)}`
+        + '&mode=ArtList&maxrecords=40&format=json&timespan=7d&sort=datedesc';
+      const res = await ctx.http.getJson<ArtListResponse>(url, {
+        cacheTtlHours: 6,
+        retries: 2,
+        minBackoffMs: RATE_LIMIT_MS,
+      });
+      for (const a of res?.articles ?? []) {
+        if (!a.url || !a.title) continue;
+        events.push({
+          // Hash the URL so re-running never duplicates an article.
+          id: createHash('sha256').update(`${topic.id}|${a.url}`).digest('hex').slice(0, 32),
+          ts: parseSeenDate(a.seendate) ?? new Date().toISOString(),
+          sourceId: 'gdelt',
+          category: topic.id,
+          headline: a.title.slice(0, 500),
+          url: a.url,
+          severity: topic.severity,
+          entities: [a.sourcecountry, a.domain].filter((x): x is string => Boolean(x)),
+        });
+      }
+    };
+
+    const fetchTimeline = async (topic: Topic): Promise<void> => {
+      const url = 'https://api.gdeltproject.org/api/v2/doc/doc'
+        + `?query=${queryFor(topic)}`
+        + '&mode=TimelineVol&format=json&timespan=12m';
+      const res = await ctx.http.getJson<TimelineResponse>(url, {
+        cacheTtlHours: 12,
+        retries: 2,
+        minBackoffMs: RATE_LIMIT_MS,
+      });
+      const points = res?.timeline?.[0]?.data ?? [];
+      let n = 0;
+      for (const p of points) {
+        const date = parseSeenDate(p.date)?.slice(0, 10);
+        if (!date || typeof p.value !== 'number' || !Number.isFinite(p.value)) continue;
+        observations.push({ seriesId: `news.${topic.id}`, obsDate: date, value: p.value });
+        n++;
+      }
+      // An empty timeline is a failure, not an empty series: declaring the
+      // series here with no observations behind it would create a row that is
+      // stale from birth.
+      if (n === 0) throw new Error('timeline returned no usable points');
+      series.push({
+        id: `news.${topic.id}`,
+        name: `News intensity — ${topic.name}`,
+        unit: 'percent of global coverage',
+        cadence: 'daily',
+        sourceId: 'gdelt',
+        pillar: 'narrative',
+        sourceUrl: 'https://www.gdeltproject.org/',
+        notes: `${topic.notes} Measures how much the world is talking about this, not whether it is true — corroboration only.`,
+        stalenessBudgetDays: 5,
+      });
+    };
+
+    /** Run one call, recording or clearing its error. Never throws. */
+    const attempt = async (
+      topic: Topic,
+      errors: Map<string, string>,
+      fn: (t: Topic) => Promise<void>,
+    ): Promise<void> => {
+      try {
+        await fn(topic);
+        errors.delete(topic.id);
+      } catch (err) {
+        errors.set(topic.id, (err as Error).message);
+      }
+      await sleep(RATE_LIMIT_MS);
+    };
 
     for (const topic of TOPICS) {
-      // --- article feed ---
-      try {
-        const url = 'https://api.gdeltproject.org/api/v2/doc/doc'
-          + `?query=${encodeURIComponent(`${topic.query} sourcelang:english`)}`
-          + '&mode=ArtList&maxrecords=40&format=json&timespan=7d&sort=datedesc';
-        // Few retries: GDELT's limiter counts every attempt, so aggressive
-        // retrying makes the rate-limit problem worse rather than better.
-        const res = await ctx.http.getJson<ArtListResponse>(url, { cacheTtlHours: 6, retries: 1 });
-        for (const a of res?.articles ?? []) {
-          if (!a.url || !a.title) continue;
-          events.push({
-            // Hash the URL so re-running never duplicates an article.
-            id: createHash('sha256').update(`${topic.id}|${a.url}`).digest('hex').slice(0, 32),
-            ts: parseSeenDate(a.seendate) ?? new Date().toISOString(),
-            sourceId: 'gdelt',
-            category: topic.id,
-            headline: a.title.slice(0, 500),
-            url: a.url,
-            severity: topic.severity,
-            entities: [a.sourcecountry, a.domain].filter((x): x is string => Boolean(x)),
-          });
-        }
-      } catch (err) {
-        warnings.push(`${topic.id} articles: ${(err as Error).message}`);
-      }
-      await sleep(6500);
-
-      // --- coverage volume as a numeric series ---
-      try {
-        const url = 'https://api.gdeltproject.org/api/v2/doc/doc'
-          + `?query=${encodeURIComponent(`${topic.query} sourcelang:english`)}`
-          + '&mode=TimelineVol&format=json&timespan=12m';
-        const res = await ctx.http.getJson<TimelineResponse>(url, { cacheTtlHours: 12, retries: 1 });
-        const points = res?.timeline?.[0]?.data ?? [];
-        let n = 0;
-        for (const p of points) {
-          const date = parseSeenDate(p.date)?.slice(0, 10);
-          if (!date || typeof p.value !== 'number' || !Number.isFinite(p.value)) continue;
-          observations.push({ seriesId: `news.${topic.id}`, obsDate: date, value: p.value });
-          n++;
-        }
-        if (n > 0) {
-          series.push({
-            id: `news.${topic.id}`,
-            name: `News intensity — ${topic.name}`,
-            unit: 'percent of global coverage',
-            cadence: 'daily',
-            sourceId: 'gdelt',
-            pillar: 'narrative',
-            sourceUrl: 'https://www.gdeltproject.org/',
-            notes: `${topic.notes} Measures how much the world is talking about this, not whether it is true — corroboration only.`,
-            stalenessBudgetDays: 5,
-          });
-        }
-      } catch (err) {
-        warnings.push(`${topic.id} timeline: ${(err as Error).message}`);
-      }
-      await sleep(6500);
+      await attempt(topic, articleErrors, fetchArticles);
+      await attempt(topic, timelineErrors, fetchTimeline);
     }
 
-    ctx.log(`${events.length} events, ${series.length} narrative series`);
+    // --- second pass, for whatever the limiter refused the first time ---
+    //
+    // The timeline is what this connector exists for, so it is retried first
+    // and unconditionally; the article feed only decorates the events list.
+    const retryTopics = TOPICS.filter((t) => timelineErrors.has(t.id) || articleErrors.has(t.id));
+    if (retryTopics.length > 0) {
+      ctx.log(`retrying ${retryTopics.length} topic(s) after ${RETRY_COOLDOWN_MS / 1000}s`);
+      await sleep(RETRY_COOLDOWN_MS);
+      for (const topic of retryTopics) {
+        if (timelineErrors.has(topic.id)) await attempt(topic, timelineErrors, fetchTimeline);
+        if (articleErrors.has(topic.id)) await attempt(topic, articleErrors, fetchArticles);
+      }
+    }
+
+    // Only what failed twice is worth reporting: a warning for something the
+    // retry fixed would mark the source `partial` over a transient 429.
+    const warnings = [
+      ...[...articleErrors].map(([id, e]) => `${id} articles: ${e}`),
+      ...[...timelineErrors].map(([id, e]) => `${id} timeline: ${e}`),
+    ];
+
+    ctx.log(`${events.length} events, ${series.length}/${TOPICS.length} narrative series`);
     if (events.length === 0 && series.length === 0) {
       throw new Error(`GDELT returned nothing. ${warnings.slice(0, 2).join('; ')}`);
     }

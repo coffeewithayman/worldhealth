@@ -233,7 +233,7 @@ signal that cannot be evaluated must never render as a signal that is quiet.
 | **LBMA** | Gold, silver, platinum, palladium benchmarks in USD/GBP/EUR, **back to 1968** | Better than any paid metals API, and free |
 | **IMF PortWatch** | Daily transits and tonnage through 11 maritime chokepoints, from satellite AIS | Daily granularity, **refreshed weekly (Tuesdays)** |
 | **BIS** | Real residential property prices and credit-to-GDP gaps, 18 economies | Quarterly, published with a lag |
-| **GDELT** | News event feed + narrative intensity as a scoreable series | Rate limited to 1 req/5s; a full pass takes ~2 min |
+| **GDELT** | News event feed + narrative intensity as a scoreable series | Rate limited to 1 req/5s; a full pass takes ~2 min, plus a ~30s retry pass if any topic is throttled |
 | **CoinGecko** | Bitcoin, and **stablecoin supply** as an offshore dollar-demand proxy | Works without a key |
 
 ### Keyed
@@ -522,16 +522,48 @@ counts on the Sources tab, and age badges on individual series. Every series car
 a `stalenessBudgetDays` set from its *publication lag*, not its cadence.
 
 The budget has to cover a full period **plus** the label offset plus the release
-lag, because observations are labelled at period *start*. A monthly series labelled
-`2026-06-01` is the newest available until mid-August, so anything under ~80 days
-flags healthy data as broken for half of every month; quarterly bank call-report
-data labelled `2026-01-01` needs ~260. Budgets tuned to cadence alone are the reason
-a staleness banner stops being read.
+lag, because observations are labelled at period *start*. The arithmetic worth
+writing down: for a monthly series covering month M released on day D of month M+1,
+the newest observation peaks at roughly **61 + D days** old just before the next
+release — 87 for Core PCE, which lands around the 26th, and ~97 for the trade
+balance, which BEA publishes two months in arrears. A budget of 80 therefore flags
+Core PCE every month from about the 14th onward, on data that is perfectly current.
+Quarterly series labelled at period start need ~260, and the two that run a further
+quarter behind (`us.federal_debt`, `us.debt_service_ratio`) need ~320.
+
+Budgets tuned to cadence alone — or to an estimate of the lag rather than the
+observed one — are the reason a staleness banner stops being read.
+`packages/connectors/src/catalog.test.ts` pins the corrected budgets against that
+arithmetic and enforces a structural floor: no monthly budget below 62 days, no
+quarterly one below 184, since two consecutive period-start labels are already that
+far apart.
 
 A stale series is dropped from scoring rather than treated as current, and counted
 against its pillar's coverage. The failure mode this prevents is the one that could
 actually cost money: a dead feed quietly showing months-old numbers as if they were
 today's.
+
+### Retired series
+
+A series the upstream has **discontinued** is finished, not broken, and the
+difference is load-bearing. FRED stopped publishing `NPTLTL` (nonperforming loans to
+total loans) after 2020-07-01; left as an ordinary series it raised a warning every
+day whose age grew by one every day, and whose named fix — re-run the source — could
+never work. An alert nobody can act on is the one that teaches people to skim the
+list.
+
+A connector marks such a series with `retiredAt` (see `retired:` in the FRED
+catalogue). Retired series are not fetched, are never counted as stale, and are
+excluded from the per-source "N of M past their budget" denominator, so *all* series
+of a source being stale keeps meaning the feed is dead. Their history stays in the
+database and still scores in an `--as-of` backtest inside the window they covered.
+The column arrives on an existing database through `ADDED_COLUMNS` in
+`core/src/schema.ts`, applied by `npm run migrate`.
+
+Retiring is not the same as replacing. `NPTLTL`'s closest live substitute is
+`DRALACBN` (delinquency rate on all loans, all commercial banks); adding it is a new
+indicator and owes the usual two-date live verification, so it is deliberately not
+bundled with the retirement.
 
 ---
 

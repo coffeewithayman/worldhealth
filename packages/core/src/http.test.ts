@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { Http, HttpError, redactUrl } from './http.js';
+import { Http, HttpError, parseRetryAfter, redactUrl } from './http.js';
 import { createLogger } from './log.js';
 import { MemoryStore } from './memory-store.js';
 
@@ -65,6 +65,43 @@ test('a 429 is retried and the eventual body is returned', async () => {
     assert.equal(body, 'recovered');
     assert.equal(f.calls.length, 2);
   } finally { f.restore(); }
+});
+
+test('minBackoffMs holds a retry back past the rate-limit window', async () => {
+  // GDELT refuses a second request inside five seconds, so the default curve's
+  // ~1s first retry is refused too and spends a request being refused. The
+  // floor is the difference between a retry that can work and one that cannot.
+  const f = stubFetch([status(429), ok('recovered')]);
+  const t0 = Date.now();
+  try {
+    const body = await client().getText('https://x.test/a', {
+      retries: 2, cacheTtlHours: 0, minBackoffMs: 300,
+    });
+    assert.equal(body, 'recovered');
+    assert.ok(Date.now() - t0 >= 300, 'the retry must wait at least the configured floor');
+  } finally { f.restore(); }
+});
+
+test('Retry-After is honoured over the backoff curve', async () => {
+  const f = stubFetch([
+    () => new Response('', { status: 429, headers: { 'retry-after': '0.4' } }),
+    ok('recovered'),
+  ]);
+  const t0 = Date.now();
+  try {
+    assert.equal(await client().getText('https://x.test/a', { retries: 2, cacheTtlHours: 0 }), 'recovered');
+    assert.ok(Date.now() - t0 >= 400, 'a server that states its wait knows better than our curve');
+  } finally { f.restore(); }
+});
+
+test('parseRetryAfter reads both spellings and refuses to stall the pipeline', () => {
+  assert.equal(parseRetryAfter('5'), 5000);
+  assert.equal(parseRetryAfter(null), 0);
+  assert.equal(parseRetryAfter('not-a-date'), 0);
+  // A date in the past means "now", not a negative sleep.
+  assert.equal(parseRetryAfter(new Date(Date.now() - 60_000).toUTCString()), 0);
+  // Capped: an hour from a misconfigured proxy must not freeze the stage.
+  assert.equal(parseRetryAfter('86400'), 60_000);
 });
 
 test('a 403 is not retried — it is a bug in our request, not a transient fault', async () => {

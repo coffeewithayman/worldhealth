@@ -282,14 +282,23 @@ export function computeAlerts(input: AlertInput): Alert[] {
   const staleBySource = new Map<string, SeriesHealth[]>();
   for (const [sourceId, ids] of seriesBySource) {
     if (explained.has(sourceId)) continue;
-    const stale = ids.map((id) => healthById.get(id)).filter((h): h is SeriesHealth => !!h && h.stale);
+    // `retired` is belt-and-braces: the store already reports a discontinued
+    // series as not stale, but a health row assembled anywhere else must not be
+    // able to put an alert on the board whose only honest action is "nothing".
+    const stale = ids
+      .map((id) => healthById.get(id))
+      .filter((h): h is SeriesHealth => !!h && h.stale && !h.retired);
     if (stale.length > 0) staleBySource.set(sourceId, stale);
   }
 
   const connById = new Map(input.connectors.map((c) => [c.id, c]));
   for (const [sourceId, stale] of [...staleBySource].sort((a, b) => b[1].length - a[1].length)) {
     const conn = connById.get(sourceId);
-    const total = seriesBySource.get(sourceId)?.length ?? stale.length;
+    // Retired series are excluded from the denominator too, so "8 of 8 series
+    // past their budget" keeps meaning "this feed is dead" rather than being
+    // diluted by series that ended years ago.
+    const live = (seriesBySource.get(sourceId) ?? []).filter((id) => !healthById.get(id)?.retired);
+    const total = live.length || stale.length;
     const allStale = stale.length === total;
     const worst = stale.reduce((a, h) => ((h.ageDays ?? Infinity) > (a.ageDays ?? Infinity) ? h : a), stale[0]!);
     const derived = sourceId === 'derived';

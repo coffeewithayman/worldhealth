@@ -65,9 +65,12 @@ export const bisConnector: Connector = {
           sourceUrl: 'https://data.bis.org/topics/RPP',
           notes: 'Inflation-adjusted, so cross-country and cross-decade comparisons are meaningful. Property busts are the most reliable precursor of banking crises.',
           // Quarterly, but publication lag varies a lot by country — Japan and
-          // the Netherlands routinely run ~10 months behind. 330 days covers the
-          // slowest reporters without masking a genuinely dead feed.
-          stalenessBudgetDays: 330,
+          // the Netherlands routinely run ~10 months behind, and Japan is a full
+          // quarter behind the rest of this panel (354 days on 2026-09-20 while
+          // the other 17 had Q1 2026). 420 days is a country a quarter behind
+          // the slowest reporter, which is the real worst case here rather than
+          // the estimate 330 was based on.
+          stalenessBudgetDays: 420,
         });
       } catch (err) {
         warnings.push(`property ${area}: ${(err as Error).message}`);

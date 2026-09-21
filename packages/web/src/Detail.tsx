@@ -237,6 +237,9 @@ export function SeriesView({ id, onBack }: { id: string; onBack: () => void }) {
 
   const stats = data.stats;
   const stale = data.health?.stale ?? false;
+  // A discontinued series is complete, not broken. Showing "stale · 2272d old"
+  // on it invites someone to go looking for a feed to fix that does not exist.
+  const retired = data.health?.retired ?? false;
   const usePct = stats.pctMeaningful;
   const cadence = data.series.cadence;
   // A zero line only earns its ink where zero is a real boundary — a spread
@@ -250,6 +253,11 @@ export function SeriesView({ id, onBack }: { id: string; onBack: () => void }) {
         <div className="row" style={{ gap: 10, alignItems: 'baseline' }}>
           <h2 style={{ margin: 0, fontSize: 20, letterSpacing: '-0.015em' }}>{data.series.name}</h2>
           {stale && <span className="badge badge-stale">stale · {data.health?.ageDays}d old</span>}
+          {retired && (
+            <span className="badge" title="The upstream stopped publishing this series.">
+              retired{data.health?.retiredAt ? ` · ended ${data.health.retiredAt}` : ''}
+            </span>
+          )}
         </div>
         <div className="row small muted" style={{ marginTop: 6, gap: 8 }}>
           <span className="mono">{data.series.id}</span>
@@ -356,7 +364,7 @@ export function SeriesView({ id, onBack }: { id: string; onBack: () => void }) {
               <tr>
                 <td className="muted">Staleness budget</td>
                 <td>
-                  {data.health?.stalenessBudgetDays ?? '—'} days
+                  {retired ? 'n/a — retired' : `${data.health?.stalenessBudgetDays ?? '—'} days`}
                   {data.health && (
                     <span className={data.health.stale ? '' : 'muted'} style={{ marginLeft: 8, color: data.health.stale ? 'var(--status-serious)' : undefined }}>
                       (currently {data.health.ageDays ?? '—'} days old)

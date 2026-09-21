@@ -66,6 +66,16 @@ export interface SeriesDef {
    * with a 6-week lag needs ~50, not ~30.
    */
   stalenessBudgetDays: number;
+  /**
+   * The date of the last observation the upstream will ever publish, for a
+   * series that has been discontinued.
+   *
+   * A retired series is finished, not broken, and the difference matters: its
+   * history stays queryable for backtests, but it must stop counting as stale
+   * or it raises an alert every day forever whose age only ever grows — which
+   * is exactly the alert that trains a reader to ignore the list.
+   */
+  retiredAt?: IsoDate;
 }
 
 /** A discrete newsworthy occurrence, as opposed to a numeric observation. */
@@ -128,6 +138,13 @@ export interface SeriesHealth {
   /** Days between `lastObsDate` and today. Null when there is no data at all. */
   ageDays: number | null;
   stale: boolean;
+  /**
+   * Set when the upstream has discontinued the series. Retired series are
+   * never `stale` — there is no fix, so an alert naming one would have no
+   * command to put under it.
+   */
+  retired: boolean;
+  retiredAt: IsoDate | null;
 }
 
 export type ScoreKind = 'indicator' | 'pillar' | 'composite' | 'watchlist';

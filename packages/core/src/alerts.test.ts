@@ -49,6 +49,8 @@ function health(seriesId: string, over: Partial<SeriesHealth> = {}): SeriesHealt
     stalenessBudgetDays: 7,
     ageDays: 1,
     stale: false,
+    retired: false,
+    retiredAt: null,
     ...over,
   };
 }
@@ -237,6 +239,35 @@ test('stale series are grouped per source rather than listed one by one', () => 
   assert.equal(alerts.filter((a) => a.kind === 'series_stale').length, 1, 'one alert per source, not per series');
   assert.match(group.title, /2 of 3/);
   assert.match(group.detail, /us\.m2/, 'names the worst offender so it can be checked directly');
+});
+
+test('a retired series never raises a stale alert', () => {
+  // `us.nonperforming_loans` ended in 2020 when FRED discontinued it. Before
+  // retirement it raised a warning every day whose age grew by one every day
+  // and whose named fix — re-run the source — could not possibly work.
+  const alerts = computeAlerts(healthyInput({
+    series: [{ id: 'us.m2', sourceId: 'fred' }, { id: 'us.nonperforming_loans', sourceId: 'fred' }],
+    health: [
+      health('us.m2'),
+      health('us.nonperforming_loans', { stale: true, retired: true, retiredAt: '2020-07-01', ageDays: 2272 }),
+    ],
+  }));
+  assert.equal(byKind(alerts, 'series_stale'), undefined);
+});
+
+test('a retired series is out of the denominator, so "all stale" still means dead', () => {
+  // Otherwise one genuinely broken series alongside one retired one reads as
+  // "1 of 2", which downgrades the alert that should say the feed is dead.
+  const alerts = computeAlerts(healthyInput({
+    series: [{ id: 'us.m2', sourceId: 'fred' }, { id: 'us.nonperforming_loans', sourceId: 'fred' }],
+    health: [
+      health('us.m2', { stale: true, ageDays: 90 }),
+      health('us.nonperforming_loans', { stale: false, retired: true, retiredAt: '2020-07-01', ageDays: 2272 }),
+    ],
+  }));
+  const group = byKind(alerts, 'series_stale')!;
+  assert.match(group.title, /1 of 1/);
+  assert.equal(group.severity, 'critical');
 });
 
 test('every series of a working source being stale is critical, not a warning', () => {

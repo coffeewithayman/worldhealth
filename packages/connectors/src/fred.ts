@@ -12,6 +12,15 @@ interface FredSeries {
   pillar: Pillar;
   stalenessBudgetDays: number;
   notes?: string;
+  /**
+   * Date of the final observation, for a series FRED has discontinued.
+   *
+   * The entry stays in the catalogue rather than being deleted: it records
+   * that the series existed, why it stopped, and stops anyone re-adding it
+   * after finding the id in an old notebook. Retired series are not fetched
+   * and are never counted as stale.
+   */
+  retired?: string;
 }
 
 /**
@@ -23,12 +32,21 @@ interface FredSeries {
  * Staleness budgets are set from *publication lag*, not cadence. Quarterly bank
  * delinquency data lands roughly 70 days after quarter-end, so a 30-day budget
  * would flag healthy data as broken every single quarter.
+ *
+ * The arithmetic that matters, and the one that keeps being got wrong: FRED
+ * labels an observation at the *start* of the period it covers, so the age of
+ * the newest observation peaks just before the next release, not just after it.
+ * For a monthly series covering month M released on day D of month M+1, that
+ * peak is roughly `61 + D` days — 87 for Core PCE, which lands around the 26th.
+ * A budget set to "about a cadence plus a bit" therefore fires every month on
+ * perfectly healthy data, which is the fastest way to teach the reader that the
+ * stale badge means nothing. Budgets below are the peak plus a few days' slack.
  */
 const CATALOG: FredSeries[] = [
   // ---------------------------------------------------------------- monetary
-  { fred: 'M2SL', id: 'us.m2', name: 'M2 Money Stock', unit: 'billions USD', cadence: 'monthly', pillar: 'monetary', stalenessBudgetDays: 80,
+  { fred: 'M2SL', id: 'us.m2', name: 'M2 Money Stock', unit: 'billions USD', cadence: 'monthly', pillar: 'monetary', stalenessBudgetDays: 95,
     notes: 'Year-over-year contraction in M2 has happened only in the 1930s and 2023. A core depression precursor.' },
-  { fred: 'BOGMBASE', id: 'us.monetary_base', name: 'Monetary Base', unit: 'billions USD', cadence: 'monthly', pillar: 'monetary', stalenessBudgetDays: 80 },
+  { fred: 'BOGMBASE', id: 'us.monetary_base', name: 'Monetary Base', unit: 'billions USD', cadence: 'monthly', pillar: 'monetary', stalenessBudgetDays: 95 },
   { fred: 'WRESBAL', id: 'us.bank_reserves', name: 'Reserve Balances at Federal Reserve Banks', unit: 'billions USD', cadence: 'weekly', pillar: 'monetary', stalenessBudgetDays: 12,
     notes: 'When reserves drain toward scarcity, repo markets break first.' },
   { fred: 'WALCL', id: 'us.fed_assets', name: 'Fed Total Assets', unit: 'millions USD', cadence: 'weekly', pillar: 'monetary', stalenessBudgetDays: 12 },
@@ -40,7 +58,7 @@ const CATALOG: FredSeries[] = [
   { fred: 'T5YIFR', id: 'us.forward_inflation_5y5y', name: '5y5y Forward Inflation Expectation', unit: 'percent', cadence: 'daily', pillar: 'monetary', stalenessBudgetDays: 5,
     notes: 'The market’s read on whether the central bank has lost control of the price level.' },
   { fred: 'CPIAUCSL', id: 'us.cpi', name: 'CPI All Urban Consumers', unit: 'index', cadence: 'monthly', pillar: 'monetary', stalenessBudgetDays: 80 },
-  { fred: 'PCEPILFE', id: 'us.core_pce', name: 'Core PCE Price Index', unit: 'index', cadence: 'monthly', pillar: 'monetary', stalenessBudgetDays: 80 },
+  { fred: 'PCEPILFE', id: 'us.core_pce', name: 'Core PCE Price Index', unit: 'index', cadence: 'monthly', pillar: 'monetary', stalenessBudgetDays: 95 },
   { fred: 'CORESTICKM159SFRBATL', id: 'us.sticky_cpi', name: 'Sticky Price CPI (Atlanta Fed)', unit: 'percent YoY', cadence: 'monthly', pillar: 'monetary', stalenessBudgetDays: 80 },
   { fred: 'RRPONTSYD', id: 'us.reverse_repo', name: 'Overnight Reverse Repurchase Agreements', unit: 'billions USD', cadence: 'daily', pillar: 'monetary', stalenessBudgetDays: 5,
     notes: 'The drain of the RRP facility marks the transition from excess to scarce liquidity.' },
@@ -52,7 +70,10 @@ const CATALOG: FredSeries[] = [
   // is the closest freely available proxy. Named for what it actually measures.
   { fred: 'BAMLEMHBHYCRPIOAS', id: 'em.sovereign_oas', name: 'Emerging Market High Yield Corporate OAS', unit: 'percent', cadence: 'daily', pillar: 'sovereign', stalenessBudgetDays: 6,
     notes: 'Proxy for EM sovereign stress: FRED has no free sovereign OAS series. EM corporates are dollar-funded, so this widens with the same dollar-funding squeeze that breaks sovereigns — but it is corporate credit, not sovereign.' },
-  { fred: 'GFDEBTN', id: 'us.federal_debt', name: 'Federal Debt: Total Public Debt', unit: 'millions USD', cadence: 'quarterly', pillar: 'sovereign', stalenessBudgetDays: 260 },
+  // Runs a quarter behind its quarterly siblings: on 2026-09-20 every other
+  // quarterly series here had Q2, this had only Q1 (262 days old and still the
+  // newest FRED served). 320 covers a Q+9-month lag without masking a dead feed.
+  { fred: 'GFDEBTN', id: 'us.federal_debt', name: 'Federal Debt: Total Public Debt', unit: 'millions USD', cadence: 'quarterly', pillar: 'sovereign', stalenessBudgetDays: 320 },
   { fred: 'A091RC1Q027SBEA', id: 'us.federal_interest', name: 'Federal Government Interest Payments', unit: 'billions USD SAAR', cadence: 'quarterly', pillar: 'sovereign', stalenessBudgetDays: 260,
     notes: 'Against receipts, this is the fiscal-dominance ratio: the point where debt service crowds out policy.' },
   { fred: 'FGRECPT', id: 'us.federal_receipts', name: 'Federal Government Current Receipts', unit: 'billions USD SAAR', cadence: 'quarterly', pillar: 'sovereign', stalenessBudgetDays: 260 },
@@ -104,7 +125,17 @@ const CATALOG: FredSeries[] = [
   { fred: 'AAA10Y', id: 'us.aaa_spread', name: 'Moody\'s Aaa Corporate Minus 10-Year Treasury', unit: 'percent', cadence: 'daily', pillar: 'credit', stalenessBudgetDays: 6 },
   { fred: 'DRTSCILM', id: 'us.lending_standards_ci', name: 'Net % of Banks Tightening C&I Lending Standards', unit: 'percent', cadence: 'quarterly', pillar: 'credit', stalenessBudgetDays: 230,
     notes: 'From the Senior Loan Officer Survey. Banks tightening into a slowdown is the mechanism that turns a downturn into a credit crunch.' },
-  { fred: 'NPTLTL', id: 'us.nonperforming_loans', name: 'Nonperforming Loans to Total Loans', unit: 'percent', cadence: 'quarterly', pillar: 'credit', stalenessBudgetDays: 230 },
+  // Discontinued upstream: a 25-year refetch on 2026-09-20 still ended at
+  // 2020-07-01, so FRED is not going to publish another point. It fed no
+  // indicator in config/indicators.yaml, so retiring it changes no score — it
+  // only stops an alert whose age grew by a day every day and could never be
+  // fixed by any command the alert was able to name. The closest live
+  // replacement is DRALACBN (delinquency rate on all loans, all commercial
+  // banks); adding it needs the two-date live verification this repo asks of a
+  // new indicator, so it is deliberately left as separate work.
+  { fred: 'NPTLTL', id: 'us.nonperforming_loans', name: 'Nonperforming Loans to Total Loans', unit: 'percent', cadence: 'quarterly', pillar: 'credit', stalenessBudgetDays: 230,
+    retired: '2020-07-01',
+    notes: 'Discontinued by FRED after 2020-07-01. Kept for its 2000-2020 history, which still scores in a backtest run with --as-of inside that window.' },
   { fred: 'CORBLACBS', id: 'us.charge_off_rate', name: 'Charge-Off Rate on Business Loans', unit: 'percent', cadence: 'quarterly', pillar: 'credit', stalenessBudgetDays: 230 },
   { fred: 'KCFSI', id: 'us.kc_financial_stress', name: 'Kansas City Financial Stress Index', unit: 'index', cadence: 'monthly', pillar: 'credit', stalenessBudgetDays: 80 },
 
@@ -128,10 +159,11 @@ const CATALOG: FredSeries[] = [
   { fred: 'MORTGAGE30US', id: 'us.mortgage_30y', name: '30-Year Fixed Mortgage Rate', unit: 'percent', cadence: 'weekly', pillar: 'realecon', stalenessBudgetDays: 12 },
   { fred: 'CSUSHPINSA', id: 'us.case_shiller', name: 'Case-Shiller US National Home Price Index', unit: 'index', cadence: 'monthly', pillar: 'realecon', stalenessBudgetDays: 115,
     notes: 'Published with a two-month lag, so treat it as confirmation rather than warning.' },
-  { fred: 'MSACSR', id: 'us.months_supply_homes', name: 'Monthly Supply of New Houses', unit: 'months', cadence: 'monthly', pillar: 'realecon', stalenessBudgetDays: 80 },
+  { fred: 'MSACSR', id: 'us.months_supply_homes', name: 'Monthly Supply of New Houses', unit: 'months', cadence: 'monthly', pillar: 'realecon', stalenessBudgetDays: 95 },
   { fred: 'RECPROUSM156N', id: 'us.recession_probability', name: 'Smoothed US Recession Probability', unit: 'percent', cadence: 'monthly', pillar: 'realecon', stalenessBudgetDays: 90 },
   { fred: 'PPIACO', id: 'us.ppi', name: 'Producer Price Index: All Commodities', unit: 'index', cadence: 'monthly', pillar: 'realecon', stalenessBudgetDays: 80 },
-  { fred: 'TDSP', id: 'us.debt_service_ratio', name: 'Household Debt Service Ratio', unit: 'percent of disposable income', cadence: 'quarterly', pillar: 'realecon', stalenessBudgetDays: 230 },
+  // Same one-quarter-behind pattern as GFDEBTN; see the note there.
+  { fred: 'TDSP', id: 'us.debt_service_ratio', name: 'Household Debt Service Ratio', unit: 'percent of disposable income', cadence: 'quarterly', pillar: 'realecon', stalenessBudgetDays: 320 },
   { fred: 'USREC', id: 'us.nber_recession', name: 'NBER Recession Indicator', unit: '0 or 1', cadence: 'monthly', pillar: 'realecon', stalenessBudgetDays: 400,
     notes: 'Declared retrospectively, so useless as a warning — but it is the ground truth the golden-fixture tests score the model against.' },
 
@@ -167,21 +199,21 @@ const CATALOG: FredSeries[] = [
   // for the electricity a fab burns. Cobalt, lithium, polysilicon and the rare
   // earths have no free reference price at all — the listed miner indices below
   // are the closest freely available proxy, and are named as proxies.
-  { fred: 'PCOPPUSDM', id: 'cmd.copper', name: 'Copper', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 80,
+  { fred: 'PCOPPUSDM', id: 'cmd.copper', name: 'Copper', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 100,
     notes: '"Dr. Copper" — the metal every grid, motor and chip interconnect needs. Against gold it is a clean growth-versus-fear ratio: both are metals, only one is monetary. Monthly here; daily LME pricing is not freely licensed.' },
-  { fred: 'PALUMUSDM', id: 'cmd.aluminum', name: 'Aluminium', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 80,
+  { fred: 'PALUMUSDM', id: 'cmd.aluminum', name: 'Aluminium', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 100,
     notes: 'Roughly 40% of its cost is electricity, so aluminium prices carry the energy shock into manufacturing faster than most metals. Used in chip packaging, heat spreaders and on-die interconnect.' },
-  { fred: 'PNICKUSDM', id: 'cmd.nickel', name: 'Nickel', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 80,
+  { fred: 'PNICKUSDM', id: 'cmd.nickel', name: 'Nickel', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 100,
     notes: 'Stainless steel, batteries, and the barrier layers and MLCC electrodes inside electronics. The 2022 LME nickel squeeze is the reference example of a metal market breaking outright.' },
-  { fred: 'PTINUSDM', id: 'cmd.tin', name: 'Tin', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 80,
+  { fred: 'PTINUSDM', id: 'cmd.tin', name: 'Tin', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 100,
     notes: 'The solder metal: almost every electrical joint in every device. Supply is unusually concentrated (Indonesia, Myanmar, China), which makes tin the most geopolitically fragile of the chip inputs.' },
-  { fred: 'PZINCUSDM', id: 'cmd.zinc', name: 'Zinc', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 80,
+  { fred: 'PZINCUSDM', id: 'cmd.zinc', name: 'Zinc', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 100,
     notes: 'Galvanising and die-casting — construction and vehicles. Included as breadth: a metals move confined to one metal is a supply story, a move across all of them is a monetary or demand story.' },
-  { fred: 'PLEADUSDM', id: 'cmd.lead', name: 'Lead', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 80,
+  { fred: 'PLEADUSDM', id: 'cmd.lead', name: 'Lead', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 100,
     notes: 'Mostly batteries. Kept for breadth across the base-metal complex.' },
-  { fred: 'PIORECRUSDM', id: 'cmd.iron_ore', name: 'Iron Ore', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 80,
+  { fred: 'PIORECRUSDM', id: 'cmd.iron_ore', name: 'Iron Ore', unit: 'USD per metric ton', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 100,
     notes: 'The purest read on Chinese construction demand available for free, and the first industrial commodity to break when Chinese property stalls.' },
-  { fred: 'PURANUSDM', id: 'cmd.uranium', name: 'Uranium', unit: 'USD per pound', cadence: 'monthly', pillar: 'energy', stalenessBudgetDays: 80,
+  { fred: 'PURANUSDM', id: 'cmd.uranium', name: 'Uranium', unit: 'USD per pound', cadence: 'monthly', pillar: 'energy', stalenessBudgetDays: 100,
     notes: 'Fuel for the baseload that fabs and data centres run on. A structurally supply-constrained market that repriced hard as AI power demand arrived.' },
 
   // ------------------------------------------------------ semiconductor complex
@@ -211,7 +243,10 @@ const CATALOG: FredSeries[] = [
     notes: 'Overnight dollars held at the Fed by foreign central banks and international accounts. Sharp drawdowns have coincided with FX intervention episodes, when reserves are converted to spend.' },
 
   // ------------------------------------------------------------------ trade
-  { fred: 'BOPGSTB', id: 'us.trade_balance', name: 'US Trade Balance: Goods and Services', unit: 'millions USD', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 70 },
+  // BEA releases month M around the 5th of month M+2 — the longest lag of any
+  // monthly series here. Just before a release the newest observation is ~97
+  // days old, so the old 70-day budget flagged it for most of every month.
+  { fred: 'BOPGSTB', id: 'us.trade_balance', name: 'US Trade Balance: Goods and Services', unit: 'millions USD', cadence: 'monthly', pillar: 'trade', stalenessBudgetDays: 105 },
   { fred: 'IMPGS', id: 'us.imports', name: 'US Imports of Goods and Services', unit: 'billions USD SAAR', cadence: 'quarterly', pillar: 'trade', stalenessBudgetDays: 260 },
 ];
 
@@ -243,9 +278,14 @@ export const fredConnector: Connector = {
     const warnings: string[] = [];
     const ok: FredSeries[] = [];
 
+    // A retired series has no more observations coming, so fetching it would
+    // spend a request to be told nothing and then warn about the silence.
+    const live = CATALOG.filter((s) => !s.retired);
+    const retired = CATALOG.filter((s) => s.retired);
+
     // FRED permits 120 requests/minute. Six at a time with this catalogue keeps
     // us well inside that even when every request is a cache miss.
-    const queue = [...CATALOG];
+    const queue = [...live];
     const worker = async (): Promise<void> => {
       for (;;) {
         const s = queue.shift();
@@ -279,12 +319,15 @@ export const fredConnector: Connector = {
     };
     await Promise.all(Array.from({ length: 6 }, worker));
 
-    ctx.log(`${ok.length}/${CATALOG.length} series returned data`);
+    ctx.log(`${ok.length}/${live.length} series returned data`
+      + (retired.length ? `, ${retired.length} retired` : ''));
     if (ok.length === 0) {
       throw new Error(`No FRED series returned data. First errors: ${warnings.slice(0, 3).join('; ')}`);
     }
 
-    const series: SeriesDef[] = ok.map((s) => ({
+    // Retired series are still declared. That is what carries `retiredAt` into
+    // the database, and it is the write that turns a permanent stale alert off.
+    const series: SeriesDef[] = [...ok, ...retired].map((s) => ({
       id: s.id,
       name: s.name,
       unit: s.unit,
@@ -294,6 +337,7 @@ export const fredConnector: Connector = {
       sourceUrl: `https://fred.stlouisfed.org/series/${s.fred}`,
       notes: s.notes,
       stalenessBudgetDays: s.stalenessBudgetDays,
+      retiredAt: s.retired,
     }));
 
     return { series, observations, warnings: warnings.length ? warnings : undefined };
