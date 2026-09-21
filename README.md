@@ -561,3 +561,12 @@ fast in-memory store is only evidence about production while the two agree.
 
 Set `WD_LOG_LEVEL=debug` to see the pipeline's own logs while a test runs; the suite
 silences them by default.
+
+---
+
+## Contributing
+
+Bug reports, new connectors and indicator proposals are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for setup, the PR checklist and the ground
+rules. If you find this useful, a star on
+[GitHub](https://github.com/coffeewithayman/worldhealth) is appreciated.

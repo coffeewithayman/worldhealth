@@ -177,6 +177,16 @@ button { font: inherit; cursor: pointer; color: inherit; background: none; borde
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-good) 18%, transparent);
 }
 .live-dot.stale::before { background: var(--status-serious); box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-serious) 18%, transparent); }
+
+.site-footer {
+  display: flex; justify-content: center; padding: 40px 0 20px; margin-top: 24px;
+  border-top: 1px solid var(--border-faint);
+}
+.gh-link {
+  display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px;
+  color: var(--text-muted); transition: color 120ms;
+}
+.gh-link:hover { color: var(--text-primary); }
 /* It is a button — it opens the Sources tab — so it needs the affordance. */
 .live-dot:hover { color: var(--text-primary); }
 
