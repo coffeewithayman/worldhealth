@@ -19,6 +19,15 @@
   // No `nodejs_compat`: worker.ts imports nothing at all, so there is no Node
   // built-in to polyfill. Adding the flag would only grow the bundle.
 
+  // No environment variables. Declared explicitly (rather than omitted) because
+  // wrangler treats this file as the source of truth: an empty `vars` states
+  // that the Worker takes no configuration, and a deploy clears anything added
+  // to it in the dashboard instead of silently inheriting it. There is nothing
+  // to configure here — every payload is precomputed by `npm run snapshot`, and
+  // any real secret (API keys for the upstream sources) belongs to the Node
+  // pipeline, which never runs on Cloudflare.
+  "vars": {},
+
   "assets": {
     // Built by `npm run snapshot` — the Vite build plus api/**.json.
     "directory": "dist-cloudflare",
